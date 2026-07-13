@@ -65,7 +65,7 @@ def test_packed_documents_isolate_outputs_and_gradients(kernel) -> None:
             name: value.detach().clone().requires_grad_(True)
             for name, value in values.items()
         }
-        out, _aux = kernel(
+        out, aux = kernel(
             tensors["q_proxy"],
             tensors["k_proxy"],
             tensors["q"],
@@ -75,7 +75,7 @@ def test_packed_documents_isolate_outputs_and_gradients(kernel) -> None:
             head_dim**-0.5,
             documents,
         )
-        out[:, 190:350].float().square().sum().backward()
+        (out[:, 190:350].float().square().sum() + aux).backward()
         return out.detach(), tensors
 
     perturbed = {name: value.clone() for name, value in inputs.items()}
@@ -84,9 +84,19 @@ def test_packed_documents_isolate_outputs_and_gradients(kernel) -> None:
         value[:, :, 350:] += torch.randn_like(value[:, :, 350:]) * 10
 
     output, tensors = run(inputs)
-    perturbed_output, _ = run(perturbed)
+    perturbed_output, perturbed_tensors = run(perturbed)
     torch.testing.assert_close(output[:, 190:350], perturbed_output[:, 190:350])
-    for tensor in tensors.values():
+    for name in ("q", "k", "v"):
+        tensor = tensors[name]
         assert tensor.grad is not None
         outside = torch.cat((tensor.grad[:, :, :190], tensor.grad[:, :, 350:]), dim=2)
         assert outside.abs().max() == 0
+    for name in ("q_proxy", "k_proxy"):
+        grad = tensors[name].grad
+        perturbed_grad = perturbed_tensors[name].grad
+        assert grad is not None and perturbed_grad is not None
+        assert grad[:, :, 190:350].abs().max() > 0
+        torch.testing.assert_close(
+            grad[:, :, 190:350],
+            perturbed_grad[:, :, 190:350],
+        )
