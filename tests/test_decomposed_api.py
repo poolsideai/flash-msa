@@ -76,7 +76,6 @@ def test_decomposed_main_and_indexer_gradients_match_combined(dense: bool) -> No
             candidate["q"],
             candidate["k"],
             candidate["v"],
-            candidate["q_proxy"].shape[1],
             scale,
             document_ids,
         )

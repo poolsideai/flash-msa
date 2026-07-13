@@ -51,98 +51,28 @@ def _validate_inputs(
         )
 
 
-class _DenseMainAttentionFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        n_proxy_heads: int,
-        scale: float,
-        document_ids: torch.Tensor,
-    ):
-        from flash_msa.warmup.msa_forward_cutedsl_warmup import run_main_forward
-
-        o_main, lse_main, _kl_loss = run_main_forward(
-            q,
-            k,
-            v,
-            scale=float(scale),
-            document_ids=document_ids,
-        )
-        ctx.save_for_backward(q, k, v, lse_main, o_main, document_ids)
-        ctx.n_proxy_heads = int(n_proxy_heads)
-        ctx.scale = float(scale)
-        ctx.mark_non_differentiable(lse_main)
-        ctx.set_materialize_grads(False)
-        out = o_main.transpose(1, 2).reshape(q.shape[0], q.shape[2], -1)
-        return out, lse_main
-
-    @staticmethod
-    def backward(ctx, grad_out: torch.Tensor | None, _grad_lse: torch.Tensor | None):
-        q, k, v, lse_main, o_main, document_ids = ctx.saved_tensors
-        if grad_out is None:
-            grad_o_main = torch.zeros_like(o_main)
-        else:
-            grad_o_main = (
-                grad_out.reshape(q.shape[0], q.shape[2], q.shape[1], q.shape[3])
-                .transpose(1, 2)
-                .contiguous()
-            )
-        from flash_msa.msa_backward_cutedsl import (
-            _derive_head_tiling,
-            run_main_backward,
-        )
-        from flash_msa.warmup.msa_backward_cutedsl_warmup import _dense_causal_schedule
-
-        _main_per_proxy, query_chunk, _rows_per_task, _proxy_query_rows = (
-            _derive_head_tiling(q.shape[1], k.shape[1], ctx.n_proxy_heads)
-        )
-        task_meta, task_qids = _dense_causal_schedule(
-            batch=q.shape[0],
-            n_proxy_heads=ctx.n_proxy_heads,
-            seq_len=q.shape[2],
-            query_chunk=2 * query_chunk,
-            device=q.device,
-        )
-        dq, dk, dv = run_main_backward(
-            q,
-            k,
-            v,
-            grad_o_main,
-            lse_main,
-            o_main,
-            task_meta,
-            task_qids,
-            document_ids,
-            n_proxy_heads=ctx.n_proxy_heads,
-            scale=ctx.scale,
-        )
-        return dq, dk, dv, None, None, None
-
-
 def dense_main_attention(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    n_proxy_heads: int,
     scale: float,
     document_list: torch.Tensor | None = None,
     *,
     cu_seqlens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run dense warmup attention with a main-gradient-only backward."""
+    """Run dense warmup attention through FlashAttention autograd."""
 
     document_ids = resolve_document_ids(q, document_list, cu_seqlens)
-    return _DenseMainAttentionFunction.apply(
+    from flash_msa.warmup.msa_forward_cutedsl_warmup import run_main_forward
+
+    o_main, lse_main, _kl_loss = run_main_forward(
         q,
         k,
         v,
-        int(n_proxy_heads),
-        float(scale),
-        document_ids,
+        scale=float(scale),
+        document_ids=document_ids,
     )
+    return o_main.transpose(1, 2).reshape(q.shape[0], q.shape[2], -1), lse_main
 
 
 def dense_proxy_vjp(
