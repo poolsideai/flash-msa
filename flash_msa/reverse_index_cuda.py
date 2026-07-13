@@ -171,6 +171,26 @@ def document_ids_from_cu_seqlens(
     )
 
 
+def resolve_document_ids(
+    q: torch.Tensor,
+    document_list: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
+) -> torch.Tensor:
+    """Return the device document IDs accepted by the native kernels."""
+
+    if document_list is not None and cu_seqlens is not None:
+        raise ValueError("document_list and cu_seqlens are mutually exclusive")
+    if cu_seqlens is not None:
+        document_list = document_ids_from_cu_seqlens(
+            cu_seqlens,
+            batch_size=q.shape[0],
+            seq_len=q.shape[2],
+        )
+    if document_list is None:
+        return torch.empty(0, device=q.device, dtype=torch.int32)
+    return document_list
+
+
 def build_reverse_index_cuda(
     block_indices: torch.Tensor,
     *,
@@ -360,4 +380,5 @@ __all__ = [
     "build_reverse_index_cuda",
     "build_sparse_attention_metadata_cuda",
     "document_ids_from_cu_seqlens",
+    "resolve_document_ids",
 ]

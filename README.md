@@ -79,6 +79,41 @@ loss = model_loss + kl_weight * kl_loss
 loss.backward()
 ```
 
+Frameworks that apply the Indexer projection VJP immediately, or that replay a
+full activation checkpoint, can use the decomposed API:
+
+```
+from flash_msa import (
+    prepare_sparse_attention,
+    sparse_main_attention,
+    sparse_proxy_vjp,
+)
+
+metadata = prepare_sparse_attention(
+    Q_proxy, K_proxy, Q, K, V, top_k, head_dim ** -0.5, document_ids
+)
+attn_out, main_lse = sparse_main_attention(
+    Q, K, V, metadata, head_dim ** -0.5
+)
+dQ_proxy, dK_proxy = sparse_proxy_vjp(
+    Q_proxy,
+    K_proxy,
+    Q,
+    K,
+    main_lse,
+    metadata,
+    head_dim ** -0.5,
+    kl_metric=kl_metric,
+)
+```
+
+Apply `dQ_proxy` and `dK_proxy` to the Indexer projection while its short-lived
+autograd graph is still available. The ordinary backward of
+`sparse_main_attention` computes only main Q/K/V gradients. `metadata` is the
+complete immutable selection and packed schedule, so a checkpoint replay can
+reuse it without rerunning selection or packing. Dense warmup provides the same
+split through `dense_main_attention` and `dense_proxy_vjp`.
+
 # Caveats
 
 1. Flash-MSA only supports headdims 128, block size 128.
