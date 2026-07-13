@@ -6,7 +6,7 @@ This module owns the Python boundary for the native fused MSA kernels.
 import torch
 
 from flash_msa.msa_select_cutedsl import compute_proxy_lse, select_blocks
-from flash_msa.msa_backward_cutedsl import run_fused_backward
+from flash_msa.msa_backward_cutedsl import _derive_head_tiling, run_fused_backward
 from flash_msa.msa_forward_cutedsl import run_main_forward
 from flash_msa.reverse_index_cuda import (
     SparseAttentionMetadata,
@@ -14,7 +14,7 @@ from flash_msa.reverse_index_cuda import (
 )
 
 BLOCK_SIZE = 128
-NATIVE_MMA_ROWS_PER_TASK = 128
+
 
 def _validate_inputs(
     q_proxy: torch.Tensor,
@@ -24,7 +24,13 @@ def _validate_inputs(
     v: torch.Tensor,
     top_k: int,
 ) -> tuple[int, int]:
-    if q_proxy.ndim != 4 or k_proxy.ndim != 4 or q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+    if (
+        q_proxy.ndim != 4
+        or k_proxy.ndim != 4
+        or q.ndim != 4
+        or k.ndim != 4
+        or v.ndim != 4
+    ):
         raise ValueError("all attention tensors must have shape (B, H, S, D)")
 
     b, n_proxy_heads, s, head_dim = q_proxy.shape
@@ -39,7 +45,9 @@ def _validate_inputs(
         and head_dim == dk == dq == dm == dv
         and n_kv_heads == n_v_heads
     ):
-        raise ValueError("q_proxy, k_proxy, q, k, and v must agree on batch, sequence, head dimension, and KV head count")
+        raise ValueError(
+            "q_proxy, k_proxy, q, k, and v must agree on batch, sequence, head dimension, and KV head count"
+        )
 
     if s % BLOCK_SIZE != 0:
         raise ValueError(f"sequence length must be divisible by {BLOCK_SIZE}, got {s}")
@@ -57,11 +65,14 @@ def _validate_inputs(
     num_blocks = s // BLOCK_SIZE
     top_k_blocks = int(top_k) // BLOCK_SIZE
     if not 1 <= top_k_blocks <= num_blocks:
-        raise ValueError(f"top_k selects {top_k_blocks} blocks, but sequence has {num_blocks} blocks")
+        raise ValueError(
+            f"top_k selects {top_k_blocks} blocks, but sequence has {num_blocks} blocks"
+        )
     if top_k_blocks > 32:
         raise NotImplementedError("No more than 32 blocks / topk=4096 supported")
 
     return num_blocks, top_k_blocks
+
 
 def _run_fused_selected_edge_backward(
     q_proxy: torch.Tensor,
@@ -81,13 +92,6 @@ def _run_fused_selected_edge_backward(
 
     bsz, n_heads, seq_len, _ = q.shape
     n_proxy_heads = q_proxy.shape[1]
-
-    main_per_proxy = int(n_heads) // int(n_proxy_heads)
-    if NATIVE_MMA_ROWS_PER_TASK % main_per_proxy != 0:
-        raise ValueError(
-            "Main q heads / proxy q heads ratio must divide "
-            "NATIVE_MMA_ROWS_PER_TASK evenly"
-        )
 
     lse_proxy = compute_proxy_lse(
         q_proxy,
@@ -116,6 +120,7 @@ def _run_fused_selected_edge_backward(
         delta_main,
         metadata.task_meta,
         metadata.task_qids,
+        metadata.document_ids,
         scale=float(scale),
         grad_kl_scale=proxy_grad_scale,
     )
@@ -137,28 +142,30 @@ class _SparseAttentionFunction(torch.autograd.Function):
         v: torch.Tensor,
         top_k: int,
         scale: float,
+        document_ids: torch.Tensor,
     ):
         b, n_proxy_heads, s, head_dim = q_proxy.shape
         n_heads = q.shape[1]
         n_kv_heads = k.shape[1]
-        num_blocks, top_k_blocks = _validate_inputs(q_proxy, k_proxy, q, k, v, int(top_k))
+        num_blocks, top_k_blocks = _validate_inputs(
+            q_proxy, k_proxy, q, k, v, int(top_k)
+        )
         block_indices = select_blocks(
             q_proxy,
             k_proxy,
+            document_ids=document_ids,
             scale=float(scale),
             num_blocks=num_blocks,
             top_k_blocks=top_k_blocks,
         )
 
-        main_per_proxy = int(n_heads) // int(n_proxy_heads)
-        if NATIVE_MMA_ROWS_PER_TASK % main_per_proxy != 0:
-            raise ValueError(
-                "Main q heads / proxy q heads ratio must divide "
-                "NATIVE_MMA_ROWS_PER_TASK evenly"
-            )
+        _main_per_proxy, query_chunk, _rows_per_task, _proxy_rows = _derive_head_tiling(
+            n_heads, n_kv_heads, n_proxy_heads
+        )
         metadata = build_sparse_attention_metadata_cuda(
             block_indices,
-            backward_query_chunk=NATIVE_MMA_ROWS_PER_TASK // main_per_proxy,
+            backward_query_chunk=2 * query_chunk,
+            document_ids=document_ids,
         )
 
         o_main, lse_main, kl_loss = run_main_forward(
@@ -181,22 +188,20 @@ class _SparseAttentionFunction(torch.autograd.Function):
             o_main,
             metadata.task_meta,
             metadata.task_qids,
-            metadata.remote_task_meta,
-            metadata.remote_task_offsets,
-            metadata.packed_qids,
-            metadata.destinations,
-            metadata.edge_positions,
+            metadata.remote_destinations,
+            metadata.remote_valid,
+            metadata.remote_cu_seqlens,
+            metadata.document_ids,
+            metadata.remote_q_document_ids,
+            metadata.remote_k_document_ids,
         )
         ctx.save_for_backward(*save_tensors)
         ctx.scale = float(scale)
-        ctx.num_remote_tasks = metadata.num_remote_tasks
-        ctx.remote_task_meta_cpu = metadata.remote_task_meta_cpu
         ctx.metadata_shape = (
             metadata.batch,
             metadata.n_proxy_heads,
             metadata.seq_len,
             metadata.top_k_blocks,
-            metadata.remote_query_chunk,
         )
         return out, kl_loss
 
@@ -212,30 +217,27 @@ class _SparseAttentionFunction(torch.autograd.Function):
             o_main,
             task_meta,
             task_qids,
-            remote_task_meta,
-            remote_task_offsets,
-            packed_qids,
-            destinations,
-            edge_positions,
+            remote_destinations,
+            remote_valid,
+            remote_cu_seqlens,
+            document_ids,
+            remote_q_document_ids,
+            remote_k_document_ids,
         ) = ctx.saved_tensors
-        batch, n_proxy_heads, seq_len, top_k_blocks, remote_query_chunk = (
-            ctx.metadata_shape
-        )
+        batch, n_proxy_heads, seq_len, top_k_blocks = ctx.metadata_shape
         metadata = SparseAttentionMetadata(
             task_meta=task_meta,
             task_qids=task_qids,
-            remote_task_meta=remote_task_meta,
-            remote_task_offsets=remote_task_offsets,
-            packed_qids=packed_qids,
-            destinations=destinations,
-            edge_positions=edge_positions,
-            num_remote_tasks=ctx.num_remote_tasks,
-            remote_task_meta_cpu=ctx.remote_task_meta_cpu,
+            remote_destinations=remote_destinations,
+            remote_valid=remote_valid,
+            remote_cu_seqlens=remote_cu_seqlens,
+            document_ids=document_ids,
+            remote_q_document_ids=remote_q_document_ids,
+            remote_k_document_ids=remote_k_document_ids,
             batch=batch,
             n_proxy_heads=n_proxy_heads,
             seq_len=seq_len,
             top_k_blocks=top_k_blocks,
-            remote_query_chunk=remote_query_chunk,
         )
 
         if grad_out is None:
@@ -243,7 +245,9 @@ class _SparseAttentionFunction(torch.autograd.Function):
         else:
             b, s, _ = grad_out.shape
             grad_o_main = (
-                grad_out.reshape(b, s, q.shape[1], q.shape[3]).transpose(1, 2).contiguous()
+                grad_out.reshape(b, s, q.shape[1], q.shape[3])
+                .transpose(1, 2)
+                .contiguous()
             )
 
         dq_proxy, dk_proxy, dq, dk, dv = _run_fused_selected_edge_backward(
@@ -259,7 +263,7 @@ class _SparseAttentionFunction(torch.autograd.Function):
             metadata,
             scale=ctx.scale,
         )
-        return dq_proxy, dk_proxy, dq, dk, dv, None, None
+        return dq_proxy, dk_proxy, dq, dk, dv, None, None, None
 
 
 def sparse_attention(
@@ -270,9 +274,21 @@ def sparse_attention(
     v: torch.Tensor,
     top_k: int,
     scale: float,
+    document_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Return (attn_out, kl_loss placeholder)
     Saves reverse-index metadata and main attention state for backward.
     """
-    return _SparseAttentionFunction.apply(q_proxy, k_proxy, q, k, v, int(top_k), float(scale))
+    if document_ids is None:
+        document_ids = torch.empty(0, device=q.device, dtype=torch.int32)
+    return _SparseAttentionFunction.apply(
+        q_proxy,
+        k_proxy,
+        q,
+        k,
+        v,
+        int(top_k),
+        float(scale),
+        document_ids,
+    )

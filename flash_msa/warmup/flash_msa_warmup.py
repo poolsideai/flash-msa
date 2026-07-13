@@ -10,7 +10,13 @@ def _validate_inputs(
     k: torch.Tensor,
     v: torch.Tensor,
 ) -> None:
-    if q_proxy.ndim != 4 or k_proxy.ndim != 4 or q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+    if (
+        q_proxy.ndim != 4
+        or k_proxy.ndim != 4
+        or q.ndim != 4
+        or k.ndim != 4
+        or v.ndim != 4
+    ):
         raise ValueError("all attention tensors must have shape (B, H, S, D)")
 
     b, n_proxy_heads, s, head_dim = q_proxy.shape
@@ -54,6 +60,7 @@ class _WarmupSparseAttentionFunction(torch.autograd.Function):
         v: torch.Tensor,
         top_k: int,
         scale: float,
+        document_ids: torch.Tensor,
     ):
         _ = int(top_k)
         _validate_inputs(q_proxy, k_proxy, q, k, v)
@@ -62,16 +69,18 @@ class _WarmupSparseAttentionFunction(torch.autograd.Function):
 
         from flash_msa.warmup.msa_forward_cutedsl_warmup import run_main_forward
 
-        o_main, lse_main, kl_loss = run_main_forward(q, k, v, scale=float(scale))
+        o_main, lse_main, kl_loss = run_main_forward(
+            q, k, v, scale=float(scale), document_ids=document_ids
+        )
         out = o_main.transpose(1, 2).reshape(q.shape[0], q.shape[2], -1)
 
-        ctx.save_for_backward(q_proxy, k_proxy, q, k, v, lse_main, o_main)
+        ctx.save_for_backward(q_proxy, k_proxy, q, k, v, lse_main, o_main, document_ids)
         ctx.scale = float(scale)
         return out, kl_loss
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor | None, grad_kl: torch.Tensor | None):
-        q_proxy, k_proxy, q, k, v, lse_main, o_main = ctx.saved_tensors
+        q_proxy, k_proxy, q, k, v, lse_main, o_main, document_ids = ctx.saved_tensors
 
         from flash_msa.warmup.msa_backward_cutedsl_warmup import run_warmup_backward
 
@@ -85,9 +94,10 @@ class _WarmupSparseAttentionFunction(torch.autograd.Function):
             o_main,
             grad_out,
             grad_kl,
+            document_ids,
             scale=ctx.scale,
         )
-        return dq_proxy, dk_proxy, dq, dk, dv, None, None
+        return dq_proxy, dk_proxy, dq, dk, dv, None, None, None
 
 
 def sparse_attention_warmup(
@@ -98,9 +108,12 @@ def sparse_attention_warmup(
     v: torch.Tensor,
     top_k: int,
     scale: float,
+    document_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute dense causal warmup attention and proxy KL gradients."""
 
+    if document_ids is None:
+        document_ids = torch.empty(0, device=q.device, dtype=torch.int32)
     return _WarmupSparseAttentionFunction.apply(
-        q_proxy, k_proxy, q, k, v, int(top_k), float(scale)
+        q_proxy, k_proxy, q, k, v, int(top_k), float(scale), document_ids
     )

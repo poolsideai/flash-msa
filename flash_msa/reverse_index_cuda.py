@@ -12,8 +12,6 @@ from torch.utils.cpp_extension import load
 
 BLOCK_SIZE = 128
 QUERY_CHUNK = 32
-REMOTE_QUERY_CHUNK = 1024
-
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _SRC = os.path.join(_THIS_DIR, "csrc", "reverse_index_cuda.cu")
 _EXT = None
@@ -51,8 +49,8 @@ def _load_ext():
 
 @dataclass
 class ReverseIndexWorkspace:
-    cache: dict[tuple[int, int, int, int, int, int, int], dict[str, torch.Tensor]] = field(
-        default_factory=dict
+    cache: dict[tuple[int, int, int, int, int, int, int], dict[str, torch.Tensor]] = (
+        field(default_factory=dict)
     )
 
     def get(
@@ -65,9 +63,10 @@ class ReverseIndexWorkspace:
         device: torch.device,
     ) -> dict[str, torch.Tensor]:
         num_blocks = seq_len // BLOCK_SIZE
-        padded_tasks = batch * n_proxy_heads * (
-            ((seq_len * top_k_blocks + query_chunk - 1) // query_chunk)
-            + num_blocks
+        padded_tasks = (
+            batch
+            * n_proxy_heads
+            * (((seq_len * top_k_blocks + query_chunk - 1) // query_chunk) + num_blocks)
         )
         device_index = device.index
         if device_index is None:
@@ -117,22 +116,20 @@ _DEFAULT_WORKSPACE = ReverseIndexWorkspace()
 
 @dataclass
 class SparseAttentionMetadata:
-    """Persistent reverse-index and compact varlen metadata for one forward."""
+    """Persistent selection and reverse-index metadata for one forward."""
 
     task_meta: torch.Tensor
     task_qids: torch.Tensor
-    remote_task_meta: torch.Tensor
-    remote_task_offsets: torch.Tensor
-    packed_qids: torch.Tensor
-    destinations: torch.Tensor
-    edge_positions: torch.Tensor
-    num_remote_tasks: int
-    remote_task_meta_cpu: torch.Tensor
+    remote_destinations: torch.Tensor
+    remote_valid: torch.Tensor
+    remote_cu_seqlens: torch.Tensor
+    document_ids: torch.Tensor
+    remote_q_document_ids: torch.Tensor
+    remote_k_document_ids: torch.Tensor
     batch: int
     n_proxy_heads: int
     seq_len: int
     top_k_blocks: int
-    remote_query_chunk: int
 
 
 def build_reverse_index_cuda(
@@ -188,9 +185,9 @@ def build_sparse_attention_metadata_cuda(
     block_indices: torch.Tensor,
     *,
     backward_query_chunk: int,
-    remote_query_chunk: int = REMOTE_QUERY_CHUNK,
+    document_ids: torch.Tensor,
 ) -> SparseAttentionMetadata:
-    """Build persistent backward tasks and compact remote-edge varlen metadata."""
+    """Build persistent padded backward tasks without host synchronization."""
 
     if block_indices.device.type != "cuda" or block_indices.ndim != 4:
         raise ValueError("block_indices must be a CUDA tensor shaped [B, Hp, S, Kb]")
@@ -198,9 +195,12 @@ def build_sparse_attention_metadata_cuda(
     batch, n_proxy_heads, seq_len, top_k_blocks = map(int, block_indices_c.shape)
     if seq_len % BLOCK_SIZE:
         raise ValueError(f"sequence length must be divisible by {BLOCK_SIZE}")
-    if remote_query_chunk < 1:
-        raise ValueError("remote_query_chunk must be positive")
-
+    if document_ids.numel():
+        if document_ids.shape != (batch, seq_len):
+            raise ValueError("document_ids must have shape [B, S]")
+        document_ids_c = document_ids.detach().to(torch.int32).contiguous()
+    else:
+        document_ids_c = document_ids.detach().to(torch.int32).contiguous()
     # Use a per-forward workspace: these tensors are saved by autograd and must
     # not be overwritten by a later forward before its corresponding backward.
     backward_workspace = ReverseIndexWorkspace()
@@ -211,93 +211,54 @@ def build_sparse_attention_metadata_cuda(
     )
 
     num_blocks = seq_len // BLOCK_SIZE
-    buckets = batch * n_proxy_heads * num_blocks
-    max_edges = batch * n_proxy_heads * seq_len * top_k_blocks
-    padded_remote_tasks = batch * n_proxy_heads * (
-        ((seq_len * top_k_blocks + remote_query_chunk - 1) // remote_query_chunk)
-        + num_blocks
+    num_buckets = batch * n_proxy_heads * num_blocks
+    num_remote_edges = batch * n_proxy_heads * seq_len * (top_k_blocks - 1)
+    remote_counts = torch.empty(
+        num_buckets, device=block_indices_c.device, dtype=torch.int32
     )
-    device = block_indices_c.device
-    remote_counts = torch.empty(buckets, device=device, dtype=torch.int32)
     remote_write_counts = torch.empty_like(remote_counts)
-    remote_bucket_offsets = torch.empty(buckets + 1, device=device, dtype=torch.int32)
-    remote_task_meta = torch.empty(
-        (padded_remote_tasks, 5), device=device, dtype=torch.int32
+    remote_cu_seqlens = torch.empty(
+        num_buckets + 1, device=block_indices_c.device, dtype=torch.int32
     )
-    remote_task_offsets = torch.empty(
-        padded_remote_tasks + 1, device=device, dtype=torch.int32
+    remote_destinations = torch.empty(
+        num_remote_edges, device=block_indices_c.device, dtype=torch.int64
     )
-    packed_qids = torch.empty(max_edges, device=device, dtype=torch.int32)
-    destinations = torch.empty(max_edges, device=device, dtype=torch.int32)
-    edge_positions = torch.empty(max_edges, device=device, dtype=torch.int32)
-    _load_ext().run_build_remote_metadata(
-        block_indices_c,
-        remote_counts,
-        remote_write_counts,
-        remote_bucket_offsets,
-        remote_task_meta,
-        remote_task_offsets,
-        packed_qids,
-        destinations,
-        edge_positions,
-        int(BLOCK_SIZE),
-        int(remote_query_chunk),
+    remote_valid = torch.empty(
+        num_remote_edges, device=block_indices_c.device, dtype=torch.uint8
     )
-    remote_task_meta_cpu = remote_task_meta.cpu()
-    num_remote_tasks = int(remote_task_meta_cpu[:, 3].count_nonzero())
+    if num_remote_edges:
+        _load_ext().run_build_remote_layout(
+            block_indices_c,
+            remote_counts,
+            remote_write_counts,
+            remote_cu_seqlens,
+            remote_destinations,
+            remote_valid,
+            int(BLOCK_SIZE),
+        )
+    if document_ids_c.numel():
+        document_ids_by_proxy = (
+            document_ids_c[:, None, :].expand(batch, n_proxy_heads, seq_len).reshape(-1)
+        )
+        remote_q_document_ids = document_ids_by_proxy[remote_destinations]
+        remote_k_document_ids = document_ids_by_proxy.contiguous()
+    else:
+        remote_q_document_ids = document_ids_c
+        remote_k_document_ids = document_ids_c
+
     return SparseAttentionMetadata(
         task_meta=task_meta,
         task_qids=task_qids,
-        remote_task_meta=remote_task_meta,
-        remote_task_offsets=remote_task_offsets,
-        packed_qids=packed_qids,
-        destinations=destinations,
-        edge_positions=edge_positions,
-        num_remote_tasks=num_remote_tasks,
-        remote_task_meta_cpu=remote_task_meta_cpu,
+        remote_destinations=remote_destinations,
+        remote_valid=remote_valid,
+        remote_cu_seqlens=remote_cu_seqlens,
+        document_ids=document_ids_c,
+        remote_q_document_ids=remote_q_document_ids,
+        remote_k_document_ids=remote_k_document_ids,
         batch=batch,
         n_proxy_heads=n_proxy_heads,
         seq_len=seq_len,
         top_k_blocks=top_k_blocks,
-        remote_query_chunk=int(remote_query_chunk),
-    )
-
-
-def merge_attention_chunk_cuda(
-    output_accum: torch.Tensor,
-    lse_accum: torch.Tensor,
-    remote_output: torch.Tensor,
-    remote_lse: torch.Tensor,
-    metadata: SparseAttentionMetadata,
-    *,
-    edge_start: int,
-) -> None:
-    _load_ext().merge_attention_chunk(
-        output_accum,
-        lse_accum,
-        remote_output,
-        remote_lse,
-        metadata.destinations,
-        metadata.edge_positions,
-        int(edge_start),
-        metadata.top_k_blocks,
-    )
-
-
-def merge_lse_chunk_cuda(
-    lse_accum: torch.Tensor,
-    remote_lse: torch.Tensor,
-    metadata: SparseAttentionMetadata,
-    *,
-    edge_start: int,
-) -> None:
-    _load_ext().merge_lse_chunk(
-        lse_accum,
-        remote_lse,
-        metadata.destinations,
-        metadata.edge_positions,
-        int(edge_start),
-        metadata.top_k_blocks,
     )
 
 
@@ -306,6 +267,4 @@ __all__ = [
     "SparseAttentionMetadata",
     "build_reverse_index_cuda",
     "build_sparse_attention_metadata_cuda",
-    "merge_attention_chunk_cuda",
-    "merge_lse_chunk_cuda",
 ]

@@ -123,7 +123,7 @@ __global__ void scatter_edges_kernel(
     }
 }
 
-__global__ void count_remote_edges_kernel(
+__global__ void count_remote_slots_kernel(
     int const* __restrict__ block_indices,
     int* __restrict__ counts,
     int B,
@@ -132,219 +132,70 @@ __global__ void count_remote_edges_kernel(
     int Kb,
     int NB)
 {
-    int64_t E = (int64_t)B * Hp * S * Kb;
+    int remote_slots = Kb - 1;
+    int64_t E = (int64_t)B * Hp * S * remote_slots;
     int64_t stride = (int64_t)blockDim.x * gridDim.x;
     for (int64_t e = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; e < E; e += stride) {
-        int64_t tmp = e / Kb;
+        int slot = (int)(e % remote_slots) + 1;
+        int64_t tmp = e / remote_slots;
         int q = (int)(tmp % S);
         tmp /= S;
         int p = (int)(tmp % Hp);
         int b = (int)(tmp / Hp);
-        int key_block = block_indices[e];
-        if ((unsigned)key_block >= (unsigned)NB || key_block >= q / 128) {
-            continue;
-        }
+        int key_block = block_indices[((int64_t)(b * Hp + p) * S + q) * Kb + slot];
+        key_block = max(0, min(NB - 1, key_block));
         int bucket = (b * Hp + p) * NB + key_block;
         atomicAdd(counts + bucket, 1);
     }
 }
 
-__global__ void scan_remote_meta_kernel(
+__global__ void scan_remote_offsets_kernel(
     int const* __restrict__ counts,
     int* __restrict__ bucket_offsets,
-    int* __restrict__ task_meta,
-    int* __restrict__ task_offsets,
-    int B,
-    int Hp,
-    int NB,
-    int query_chunk,
-    int padded_tasks)
+    int buckets)
 {
     if (blockIdx.x != 0 || threadIdx.x != 0) {
         return;
     }
 
     int edge = 0;
-    int task = 0;
-    int buckets = B * Hp * NB;
     for (int bucket = 0; bucket < buckets; ++bucket) {
         bucket_offsets[bucket] = edge;
-        int count = counts[bucket];
-        int key_block = bucket % NB;
-        int tmp = bucket / NB;
-        int proxy_head = tmp % Hp;
-        int batch = tmp / Hp;
-        for (int start = 0; start < count && task < padded_tasks; start += query_chunk) {
-            int valid = min(query_chunk, count - start);
-            int64_t row = (int64_t)task * 5;
-            task_meta[row + 0] = batch;
-            task_meta[row + 1] = proxy_head;
-            task_meta[row + 2] = key_block;
-            task_meta[row + 3] = valid;
-            task_meta[row + 4] = edge + start;
-            task_offsets[task] = edge + start;
-            ++task;
-        }
-        edge += count;
+        edge += counts[bucket];
     }
     bucket_offsets[buckets] = edge;
-    task_offsets[task] = edge;
 }
 
-__global__ void scatter_remote_edges_kernel(
+__global__ void scatter_remote_slots_kernel(
     int const* __restrict__ block_indices,
     int const* __restrict__ bucket_offsets,
     int* __restrict__ write_counts,
-    int* __restrict__ packed_qids,
-    int* __restrict__ destinations,
-    int* __restrict__ edge_positions,
+    int64_t* __restrict__ destinations,
+    uint8_t* __restrict__ valid,
     int B,
     int Hp,
     int S,
     int Kb,
     int NB)
 {
-    int64_t E = (int64_t)B * Hp * S * Kb;
+    int remote_slots = Kb - 1;
+    int64_t E = (int64_t)B * Hp * S * remote_slots;
     int64_t stride = (int64_t)blockDim.x * gridDim.x;
     for (int64_t e = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; e < E; e += stride) {
-        int slot = (int)(e % Kb);
-        int64_t tmp = e / Kb;
+        int slot = (int)(e % remote_slots) + 1;
+        int64_t tmp = e / remote_slots;
         int q = (int)(tmp % S);
         tmp /= S;
         int p = (int)(tmp % Hp);
         int b = (int)(tmp / Hp);
-        int key_block = block_indices[e];
-        if ((unsigned)key_block >= (unsigned)NB || key_block >= q / 128) {
-            continue;
-        }
+        int key_block = block_indices[((int64_t)(b * Hp + p) * S + q) * Kb + slot];
+        bool is_valid = (unsigned)key_block < (unsigned)NB && key_block < q / 128;
+        key_block = max(0, min(NB - 1, key_block));
 
         int bucket = (b * Hp + p) * NB + key_block;
         int pos = bucket_offsets[bucket] + atomicAdd(write_counts + bucket, 1);
-        int destination = (b * Hp + p) * S + q;
-        packed_qids[pos] = q;
-        destinations[pos] = destination;
-        edge_positions[(int64_t)destination * Kb + slot] = pos;
-    }
-}
-
-template <typename scalar_t>
-__global__ void merge_attention_chunk_kernel(
-    float* __restrict__ output_accum,
-    float* __restrict__ lse_accum,
-    scalar_t const* __restrict__ remote_output,
-    float const* __restrict__ remote_lse,
-    int const* __restrict__ destinations,
-    int const* __restrict__ edge_positions,
-    int edge_start,
-    int edge_count,
-    int num_destinations,
-    int heads_per_proxy,
-    int head_dim,
-    int top_k_blocks)
-{
-    int local_edge = (int)blockIdx.x;
-    if (local_edge >= edge_count) {
-        return;
-    }
-    int global_edge = edge_start + local_edge;
-    int destination = destinations[global_edge];
-    if ((unsigned)destination >= (unsigned)num_destinations) {
-        return;
-    }
-
-    // Only the lowest packed edge for this destination in the current chunk
-    // performs the merge.  It consumes every other slot for the same query,
-    // eliminating inter-CTA atomics and spin locks.
-    for (int slot = 0; slot < top_k_blocks; ++slot) {
-        int pos = edge_positions[(int64_t)destination * top_k_blocks + slot];
-        if (pos >= edge_start && pos < edge_start + edge_count && pos < global_edge) {
-            return;
-        }
-    }
-
-    __shared__ float old_weight[32];
-    __shared__ float edge_weight[32];
-    __shared__ float merged_lse[32];
-    for (int slot = 0; slot < top_k_blocks; ++slot) {
-        int pos = edge_positions[(int64_t)destination * top_k_blocks + slot];
-        if (pos < edge_start || pos >= edge_start + edge_count) {
-            continue;
-        }
-        int remote_edge = pos - edge_start;
-        if (threadIdx.x < heads_per_proxy) {
-            int h = (int)threadIdx.x;
-            float old_lse = lse_accum[(int64_t)destination * heads_per_proxy + h];
-            float new_lse = remote_lse[(int64_t)remote_edge * heads_per_proxy + h];
-            float max_lse = fmaxf(old_lse, new_lse);
-            float old_exp = expf(old_lse - max_lse);
-            float new_exp = expf(new_lse - max_lse);
-            float denom = old_exp + new_exp;
-            old_weight[h] = old_exp / denom;
-            edge_weight[h] = new_exp / denom;
-            merged_lse[h] = logf(denom) + max_lse;
-        }
-        __syncthreads();
-
-        int values = heads_per_proxy * head_dim;
-        for (int linear = (int)threadIdx.x; linear < values; linear += (int)blockDim.x) {
-            int h = linear / head_dim;
-            int64_t out_idx = (int64_t)destination * values + linear;
-            int64_t remote_idx = (int64_t)remote_edge * values + linear;
-            output_accum[out_idx] =
-                output_accum[out_idx] * old_weight[h]
-                + static_cast<float>(remote_output[remote_idx]) * edge_weight[h];
-        }
-        __syncthreads();
-        if (threadIdx.x < heads_per_proxy) {
-            int h = (int)threadIdx.x;
-            lse_accum[(int64_t)destination * heads_per_proxy + h] = merged_lse[h];
-        }
-        __syncthreads();
-    }
-}
-
-__global__ void merge_lse_chunk_kernel(
-    float* __restrict__ lse_accum,
-    float const* __restrict__ remote_lse,
-    int const* __restrict__ destinations,
-    int const* __restrict__ edge_positions,
-    int edge_start,
-    int edge_count,
-    int num_destinations,
-    int heads_per_proxy,
-    int top_k_blocks)
-{
-    if (threadIdx.x != 0) {
-        return;
-    }
-    int local_edge = (int)blockIdx.x;
-    if (local_edge >= edge_count) {
-        return;
-    }
-    int global_edge = edge_start + local_edge;
-    int destination = destinations[global_edge];
-    if ((unsigned)destination >= (unsigned)num_destinations) {
-        return;
-    }
-    for (int slot = 0; slot < top_k_blocks; ++slot) {
-        int pos = edge_positions[(int64_t)destination * top_k_blocks + slot];
-        if (pos >= edge_start && pos < edge_start + edge_count && pos < global_edge) {
-            return;
-        }
-    }
-    for (int slot = 0; slot < top_k_blocks; ++slot) {
-        int pos = edge_positions[(int64_t)destination * top_k_blocks + slot];
-        if (pos < edge_start || pos >= edge_start + edge_count) {
-            continue;
-        }
-        int remote_edge = pos - edge_start;
-        for (int h = 0; h < heads_per_proxy; ++h) {
-            int64_t idx = (int64_t)destination * heads_per_proxy + h;
-            float old_lse = lse_accum[idx];
-            float new_lse = remote_lse[(int64_t)remote_edge * heads_per_proxy + h];
-            float max_lse = fmaxf(old_lse, new_lse);
-            lse_accum[idx] = logf(expf(old_lse - max_lse) + expf(new_lse - max_lse)) + max_lse;
-        }
+        destinations[pos] = (int64_t)(b * Hp + p) * S + q;
+        valid[pos] = is_valid;
     }
 }
 
@@ -434,33 +285,28 @@ void run_build_reverse_index(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void run_build_remote_metadata(
+void run_build_remote_layout(
     torch::Tensor block_indices,
     torch::Tensor counts,
     torch::Tensor write_counts,
     torch::Tensor bucket_offsets,
-    torch::Tensor task_meta,
-    torch::Tensor task_offsets,
-    torch::Tensor packed_qids,
     torch::Tensor destinations,
-    torch::Tensor edge_positions,
-    int64_t block_size,
-    int64_t query_chunk)
+    torch::Tensor valid,
+    int64_t block_size)
 {
     CHECK_INPUT(block_indices);
     CHECK_INPUT(counts);
     CHECK_INPUT(write_counts);
     CHECK_INPUT(bucket_offsets);
-    CHECK_INPUT(task_meta);
-    CHECK_INPUT(task_offsets);
-    CHECK_INPUT(packed_qids);
-    CHECK_INPUT(destinations);
-    CHECK_INPUT(edge_positions);
+    CHECK_CUDA(destinations);
+    CHECK_CONTIGUOUS(destinations);
+    CHECK_CUDA(valid);
+    CHECK_CONTIGUOUS(valid);
 
-    TORCH_CHECK(block_size == 128, "remote metadata currently requires block_size=128");
-    TORCH_CHECK(query_chunk > 0, "query_chunk must be positive");
+    TORCH_CHECK(block_size == 128, "remote layout currently requires block_size=128");
     TORCH_CHECK(block_indices.dim() == 4, "block_indices must have shape [B, Hp, S, Kb]");
-    TORCH_CHECK(task_meta.dim() == 2 && task_meta.size(1) == 5, "task_meta must have shape [T, 5]");
+    TORCH_CHECK(destinations.scalar_type() == at::kLong, "destinations must be int64");
+    TORCH_CHECK(valid.scalar_type() == at::kByte, "valid must be uint8");
 
     int B = (int)block_indices.size(0);
     int Hp = (int)block_indices.size(1);
@@ -468,132 +314,38 @@ void run_build_remote_metadata(
     int Kb = (int)block_indices.size(3);
     int NB = S / (int)block_size;
     int buckets = B * Hp * NB;
-    int padded_tasks = (int)task_meta.size(0);
-    int64_t max_edges = (int64_t)B * Hp * S * Kb;
+    int64_t remote_edges = (int64_t)B * Hp * S * (Kb - 1);
 
     TORCH_CHECK(S % block_size == 0, "S must be divisible by block_size");
+    TORCH_CHECK(Kb > 1, "remote layout requires at least two selected blocks");
     TORCH_CHECK(counts.numel() == buckets && write_counts.numel() == buckets, "remote counts have wrong size");
     TORCH_CHECK(bucket_offsets.numel() == buckets + 1, "bucket_offsets has wrong size");
-    TORCH_CHECK(task_offsets.numel() == padded_tasks + 1, "task_offsets has wrong size");
-    TORCH_CHECK(packed_qids.numel() == max_edges && destinations.numel() == max_edges, "packed edge buffers have wrong size");
-    TORCH_CHECK(edge_positions.numel() == max_edges, "edge_positions has wrong size");
+    TORCH_CHECK(destinations.numel() == remote_edges && valid.numel() == remote_edges, "remote edge buffers have wrong size");
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     C10_CUDA_CHECK(cudaMemsetAsync(counts.data_ptr<int>(), 0, counts.numel() * sizeof(int), stream));
     C10_CUDA_CHECK(cudaMemsetAsync(write_counts.data_ptr<int>(), 0, write_counts.numel() * sizeof(int), stream));
-    C10_CUDA_CHECK(cudaMemsetAsync(task_meta.data_ptr<int>(), 0, task_meta.numel() * sizeof(int), stream));
-    C10_CUDA_CHECK(cudaMemsetAsync(task_offsets.data_ptr<int>(), 0, task_offsets.numel() * sizeof(int), stream));
-    C10_CUDA_CHECK(cudaMemsetAsync(packed_qids.data_ptr<int>(), 0xff, packed_qids.numel() * sizeof(int), stream));
-    C10_CUDA_CHECK(cudaMemsetAsync(destinations.data_ptr<int>(), 0xff, destinations.numel() * sizeof(int), stream));
-    C10_CUDA_CHECK(cudaMemsetAsync(edge_positions.data_ptr<int>(), 0xff, edge_positions.numel() * sizeof(int), stream));
+    C10_CUDA_CHECK(cudaMemsetAsync(destinations.data_ptr<int64_t>(), 0, destinations.numel() * sizeof(int64_t), stream));
+    C10_CUDA_CHECK(cudaMemsetAsync(valid.data_ptr<uint8_t>(), 0, valid.numel() * sizeof(uint8_t), stream));
 
-    int blocks = (int)std::min<int64_t>((max_edges + kThreads - 1) / kThreads, 65535);
+    int blocks = (int)std::min<int64_t>((remote_edges + kThreads - 1) / kThreads, 65535);
     blocks = std::max(blocks, 1);
-    count_remote_edges_kernel<<<blocks, kThreads, 0, stream>>>(
+    count_remote_slots_kernel<<<blocks, kThreads, 0, stream>>>(
         block_indices.data_ptr<int>(), counts.data_ptr<int>(), B, Hp, S, Kb, NB);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-    scan_remote_meta_kernel<<<1, 1, 0, stream>>>(
-        counts.data_ptr<int>(), bucket_offsets.data_ptr<int>(), task_meta.data_ptr<int>(),
-        task_offsets.data_ptr<int>(), B, Hp, NB,
-        (int)query_chunk, padded_tasks);
+    scan_remote_offsets_kernel<<<1, 1, 0, stream>>>(
+        counts.data_ptr<int>(), bucket_offsets.data_ptr<int>(), buckets);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-    scatter_remote_edges_kernel<<<blocks, kThreads, 0, stream>>>(
+    scatter_remote_slots_kernel<<<blocks, kThreads, 0, stream>>>(
         block_indices.data_ptr<int>(), bucket_offsets.data_ptr<int>(), write_counts.data_ptr<int>(),
-        packed_qids.data_ptr<int>(), destinations.data_ptr<int>(), edge_positions.data_ptr<int>(),
+        destinations.data_ptr<int64_t>(), valid.data_ptr<uint8_t>(),
         B, Hp, S, Kb, NB);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-}
-
-void merge_attention_chunk_cuda(
-    torch::Tensor output_accum,
-    torch::Tensor lse_accum,
-    torch::Tensor remote_output,
-    torch::Tensor remote_lse,
-    torch::Tensor destinations,
-    torch::Tensor edge_positions,
-    int64_t edge_start,
-    int64_t top_k_blocks)
-{
-    CHECK_CUDA(output_accum);
-    CHECK_CUDA(lse_accum);
-    CHECK_CUDA(remote_output);
-    CHECK_CUDA(remote_lse);
-    CHECK_INPUT(destinations);
-    CHECK_INPUT(edge_positions);
-    CHECK_CONTIGUOUS(output_accum);
-    CHECK_CONTIGUOUS(lse_accum);
-    CHECK_CONTIGUOUS(remote_output);
-    CHECK_CONTIGUOUS(remote_lse);
-    TORCH_CHECK(output_accum.scalar_type() == at::kFloat && lse_accum.scalar_type() == at::kFloat, "accumulators must be FP32");
-    TORCH_CHECK(remote_lse.scalar_type() == at::kFloat, "remote_lse must be FP32");
-    TORCH_CHECK(remote_output.scalar_type() == at::kHalf || remote_output.scalar_type() == at::kBFloat16, "remote_output must be FP16/BF16");
-    TORCH_CHECK(output_accum.dim() == 3 && lse_accum.dim() == 2 && remote_output.dim() == 3 && remote_lse.dim() == 2, "invalid merge tensor ranks");
-    int edge_count = (int)remote_output.size(0);
-    int num_destinations = (int)output_accum.size(0);
-    int heads_per_proxy = (int)output_accum.size(1);
-    int head_dim = (int)output_accum.size(2);
-    TORCH_CHECK(heads_per_proxy <= 32, "merge supports at most 32 heads per proxy");
-    TORCH_CHECK(lse_accum.size(0) == num_destinations && lse_accum.size(1) == heads_per_proxy, "lse_accum shape mismatch");
-    TORCH_CHECK(remote_output.size(1) == heads_per_proxy && remote_output.size(2) == head_dim, "remote_output shape mismatch");
-    TORCH_CHECK(remote_lse.size(0) == edge_count && remote_lse.size(1) == heads_per_proxy, "remote_lse shape mismatch");
-    if (edge_count == 0) {
-        return;
-    }
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    if (remote_output.scalar_type() == at::kHalf) {
-        merge_attention_chunk_kernel<at::Half><<<edge_count, 256, 0, stream>>>(
-            output_accum.data_ptr<float>(), lse_accum.data_ptr<float>(),
-            remote_output.data_ptr<at::Half>(), remote_lse.data_ptr<float>(),
-            destinations.data_ptr<int>(), edge_positions.data_ptr<int>(),
-            (int)edge_start, edge_count, num_destinations, heads_per_proxy,
-            head_dim, (int)top_k_blocks);
-    } else {
-        merge_attention_chunk_kernel<at::BFloat16><<<edge_count, 256, 0, stream>>>(
-            output_accum.data_ptr<float>(), lse_accum.data_ptr<float>(),
-            remote_output.data_ptr<at::BFloat16>(), remote_lse.data_ptr<float>(),
-            destinations.data_ptr<int>(), edge_positions.data_ptr<int>(),
-            (int)edge_start, edge_count, num_destinations, heads_per_proxy,
-            head_dim, (int)top_k_blocks);
-    }
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-}
-
-void merge_lse_chunk_cuda(
-    torch::Tensor lse_accum,
-    torch::Tensor remote_lse,
-    torch::Tensor destinations,
-    torch::Tensor edge_positions,
-    int64_t edge_start,
-    int64_t top_k_blocks)
-{
-    CHECK_CUDA(lse_accum);
-    CHECK_CUDA(remote_lse);
-    CHECK_INPUT(destinations);
-    CHECK_INPUT(edge_positions);
-    CHECK_CONTIGUOUS(lse_accum);
-    CHECK_CONTIGUOUS(remote_lse);
-    TORCH_CHECK(lse_accum.scalar_type() == at::kFloat && remote_lse.scalar_type() == at::kFloat, "LSE tensors must be FP32");
-    int edge_count = (int)remote_lse.size(0);
-    int num_destinations = (int)lse_accum.size(0);
-    int heads_per_proxy = (int)lse_accum.size(1);
-    TORCH_CHECK(remote_lse.dim() == 2 && remote_lse.size(1) == heads_per_proxy, "remote_lse shape mismatch");
-    if (edge_count == 0) {
-        return;
-    }
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    merge_lse_chunk_kernel<<<edge_count, 32, 0, stream>>>(
-        lse_accum.data_ptr<float>(), remote_lse.data_ptr<float>(),
-        destinations.data_ptr<int>(), edge_positions.data_ptr<int>(),
-        (int)edge_start, edge_count, num_destinations, heads_per_proxy,
-        (int)top_k_blocks);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("run_build_reverse_index", &run_build_reverse_index, "Build MSA reverse index on CUDA");
-    m.def("run_build_remote_metadata", &run_build_remote_metadata, "Build compact remote-edge metadata on CUDA");
-    m.def("merge_attention_chunk", &merge_attention_chunk_cuda, "Online-merge one varlen attention chunk");
-    m.def("merge_lse_chunk", &merge_lse_chunk_cuda, "Online-merge one varlen LSE chunk");
+    m.def("run_build_remote_layout", &run_build_remote_layout, "Build the MSA remote varlen layout on CUDA");
 }

@@ -39,6 +39,7 @@ class _MSASelectBlocksKernel:
         seq_len: int,
         top_k_blocks: int,
         head_dim: int,
+        has_document_mask: bool,
         num_threads: int = 128,
     ) -> None:
         if head_dim != 128:
@@ -56,6 +57,7 @@ class _MSASelectBlocksKernel:
         self.num_query_tiles = (int(seq_len) + SELECT_M - 1) // SELECT_M
         self.top_k_blocks = int(top_k_blocks)
         self.head_dim = int(head_dim)
+        self.has_document_mask = bool(has_document_mask)
         self.head_dim_padded = (int(head_dim) + 31) // 32 * 32
         self.rows_per_task = SELECT_M
         self.num_threads = int(num_threads)
@@ -65,6 +67,7 @@ class _MSASelectBlocksKernel:
         self,
         q_proxy: cute.Tensor,
         k_proxy: cute.Tensor,
+        document_ids: cute.Tensor,
         block_indices: cute.Tensor,
         softmax_scale: cutlass.Float32,
         stream: cuda.CUstream,
@@ -133,6 +136,7 @@ class _MSASelectBlocksKernel:
         self.kernel(
             q_proxy,
             k_proxy,
+            document_ids,
             block_indices,
             softmax_scale_log2,
             sQ_layout,
@@ -151,6 +155,7 @@ class _MSASelectBlocksKernel:
         self,
         q_proxy: cute.Tensor,
         k_proxy: cute.Tensor,
+        document_ids: cute.Tensor,
         block_indices: cute.Tensor,
         softmax_scale_log2: cutlass.Float32,
         sQ_layout: cute.ComposedLayout,
@@ -214,7 +219,9 @@ class _MSASelectBlocksKernel:
         acc_shape_S = thr_mma.partition_shape_C((self.rows_per_task, KEY_SLICE_SIZE))
         num_acc_rows = cute.size(tScS_mn.shape[0])
 
-        top_vals = cute.make_rmem_tensor((num_acc_rows, self.top_k_blocks), cutlass.Float32)
+        top_vals = cute.make_rmem_tensor(
+            (num_acc_rows, self.top_k_blocks), cutlass.Float32
+        )
         top_idx = cute.make_rmem_tensor((num_acc_rows, self.top_k_blocks), Int32)
         top_vals.fill(-cutlass.Float32.inf)
         for rr in cutlass.range_constexpr(num_acc_rows):
@@ -291,12 +298,21 @@ class _MSASelectBlocksKernel:
                             + Int32(key_slice * KEY_SLICE_SIZE)
                             + col_n
                         )
-                        if (not row_is_valid) or k_pos > q_pos:
+                        same_document = True
+                        if cutlass.const_expr(self.has_document_mask):
+                            if row_is_valid:
+                                same_document = (
+                                    document_ids[batch, q_pos]
+                                    == document_ids[batch, k_pos]
+                                )
+                        if (not row_is_valid) or k_pos > q_pos or not same_document:
                             acc_S_mn[rr, cc] = -cutlass.Float32.inf
 
-                    row_scores = (acc_S_mn[rr, None].load() * softmax_scale).to(
-                        self._dtype
-                    ).to(cutlass.Float32)
+                    row_scores = (
+                        (acc_S_mn[rr, None].load() * softmax_scale)
+                        .to(self._dtype)
+                        .to(cutlass.Float32)
+                    )
                     row_max = row_scores.reduce(
                         cute.ReductionOp.MAX,
                         -cutlass.Float32.inf,
@@ -440,8 +456,10 @@ def _compile_select_kernel(
     seq_len: int,
     top_k_blocks: int,
     head_dim: int,
+    has_document_mask: bool,
     q_proxy: cute.Tensor,
     k_proxy: cute.Tensor,
+    document_ids: cute.Tensor,
     block_indices: cute.Tensor,
     softmax_scale: float,
     stream: cuda.CUstream,
@@ -454,8 +472,10 @@ def _compile_select_kernel(
         int(seq_len),
         int(top_k_blocks),
         int(head_dim),
+        bool(has_document_mask),
         q_proxy.element_type,
         k_proxy.element_type,
+        document_ids.element_type,
         block_indices.element_type,
     )
     if key not in _COMPILE_CACHE:
@@ -466,11 +486,13 @@ def _compile_select_kernel(
             seq_len=seq_len,
             top_k_blocks=top_k_blocks,
             head_dim=head_dim,
+            has_document_mask=has_document_mask,
         )
         _COMPILE_CACHE[key] = cute.compile(
             kernel,
             q_proxy,
             k_proxy,
+            document_ids,
             block_indices,
             float(softmax_scale),
             stream,
@@ -482,6 +504,7 @@ def select_blocks(
     q_proxy: torch.Tensor,
     k_proxy: torch.Tensor,
     *,
+    document_ids: torch.Tensor,
     scale: float,
     num_blocks: int,
     top_k_blocks: int,
@@ -499,11 +522,16 @@ def select_blocks(
     if int(num_blocks) != seq_len // BLOCK_SIZE:
         raise ValueError("num_blocks does not match q_proxy sequence length")
     if q_proxy.shape[0] != k_proxy.shape[0] or q_proxy.shape[2:] != k_proxy.shape[2:]:
-        raise ValueError("q_proxy and k_proxy must agree on batch, sequence, and head_dim")
+        raise ValueError(
+            "q_proxy and k_proxy must agree on batch, sequence, and head_dim"
+        )
     n_proxy_kv_heads = int(k_proxy.shape[1])
 
     q_c = q_proxy.detach().contiguous()
     k_c = k_proxy.detach().contiguous()
+    document_ids_c = document_ids.detach().to(torch.int32).contiguous()
+    if document_ids_c.numel() and document_ids_c.shape != (batch, seq_len):
+        raise ValueError("document_ids must have shape [B, S]")
     block_indices = torch.empty(
         (batch, n_proxy_heads, seq_len, int(top_k_blocks)),
         dtype=torch.int32,
@@ -512,6 +540,7 @@ def select_blocks(
 
     q_t = _to_cute_tensor(q_c)
     k_t = _to_cute_tensor(k_c)
+    document_ids_t = _to_cute_tensor(document_ids_c)
     block_indices_t = _to_cute_tensor(block_indices)
     stream = cuda.CUstream(torch.cuda.current_stream(q_proxy.device).cuda_stream)
 
@@ -522,8 +551,10 @@ def select_blocks(
         seq_len,
         int(top_k_blocks),
         head_dim,
+        bool(document_ids_c.numel()),
         q_t,
         k_t,
+        document_ids_t,
         block_indices_t,
         float(scale),
         stream,
@@ -531,6 +562,7 @@ def select_blocks(
     compiled_select(
         q_t,
         k_t,
+        document_ids_t,
         block_indices_t,
         float(scale),
         stream,
@@ -558,7 +590,9 @@ def compute_proxy_lse(
 
     batch, n_proxy_heads, seq_len, head_dim = q_proxy.shape
     if q_proxy.shape[0] != k_proxy.shape[0] or q_proxy.shape[2:] != k_proxy.shape[2:]:
-        raise ValueError("q_proxy and k_proxy must agree on batch, sequence, and head_dim")
+        raise ValueError(
+            "q_proxy and k_proxy must agree on batch, sequence, and head_dim"
+        )
     if (metadata.batch, metadata.n_proxy_heads, metadata.seq_len) != (
         batch,
         n_proxy_heads,

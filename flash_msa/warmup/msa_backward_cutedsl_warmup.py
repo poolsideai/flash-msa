@@ -9,7 +9,9 @@ backward before launching the tiled gradient kernel.
 import torch
 
 BLOCK_SIZE = 128
-_SCHEDULE_CACHE: dict[tuple[int, int, int, int, int, int], tuple[torch.Tensor, torch.Tensor]] = {}
+_SCHEDULE_CACHE: dict[
+    tuple[int, int, int, int, int, int], tuple[torch.Tensor, torch.Tensor]
+] = {}
 
 
 def _device_index(device: torch.device) -> int:
@@ -72,7 +74,12 @@ def _lse_from_flash(
     seq_len: int,
 ) -> torch.Tensor:
     if lse.shape == (n_heads, batch * seq_len):
-        return lse.transpose(0, 1).contiguous().view(batch, seq_len, n_heads).permute(0, 2, 1)
+        return (
+            lse.transpose(0, 1)
+            .contiguous()
+            .view(batch, seq_len, n_heads)
+            .permute(0, 2, 1)
+        )
     if lse.shape == (batch, n_heads, seq_len):
         return lse.contiguous()
     if lse.shape == (n_heads, batch, seq_len):
@@ -85,6 +92,7 @@ def _run_proxy_lse_flash(
     k_proxy: torch.Tensor,
     *,
     scale: float,
+    document_ids: torch.Tensor,
 ) -> torch.Tensor:
     """Compute dense causal proxy LSE for the KL-gradient branch."""
 
@@ -92,13 +100,21 @@ def _run_proxy_lse_flash(
 
     batch, n_proxy_heads, seq_len, head_dim = q_proxy.shape
     n_proxy_kv_heads = k_proxy.shape[1]
-    q_pack = q_proxy.transpose(1, 2).contiguous().view(
-        batch * seq_len, n_proxy_heads, head_dim
+    q_pack = (
+        q_proxy.transpose(1, 2)
+        .contiguous()
+        .view(batch * seq_len, n_proxy_heads, head_dim)
     )
-    k_pack = k_proxy.transpose(1, 2).contiguous().view(
-        batch * seq_len, n_proxy_kv_heads, head_dim
+    k_pack = (
+        k_proxy.transpose(1, 2)
+        .contiguous()
+        .view(batch * seq_len, n_proxy_kv_heads, head_dim)
     )
-    cu_seqlens = torch.arange(batch + 1, device=q_proxy.device, dtype=torch.int32) * int(seq_len)
+    cu_seqlens = torch.arange(
+        batch + 1, device=q_proxy.device, dtype=torch.int32
+    ) * int(seq_len)
+
+    from flash_msa.sparse_flash_varlen import _causal_document_mask
 
     _out, lse = flash_attn_varlen_forward(
         q=q_pack,
@@ -109,7 +125,9 @@ def _run_proxy_lse_flash(
         max_seqlen_q=int(seq_len),
         max_seqlen_k=int(seq_len),
         softmax_scale=float(scale),
-        causal=True,
+        causal=not document_ids.numel(),
+        mask_mod=_causal_document_mask if document_ids.numel() else None,
+        aux_tensors=[document_ids.reshape(-1)] if document_ids.numel() else None,
     )
     return _lse_from_flash(lse, batch=batch, n_heads=n_proxy_heads, seq_len=seq_len)
 
@@ -124,6 +142,7 @@ def run_warmup_backward(
     o_main: torch.Tensor,
     grad_out: torch.Tensor | None,
     grad_kl: torch.Tensor | None,
+    document_ids: torch.Tensor,
     *,
     scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -144,7 +163,9 @@ def run_warmup_backward(
         grad_o_main = torch.zeros_like(o_main)
     else:
         grad_o_main = (
-            grad_out.reshape(batch, seq_len, n_heads, head_dim).transpose(1, 2).contiguous()
+            grad_out.reshape(batch, seq_len, n_heads, head_dim)
+            .transpose(1, 2)
+            .contiguous()
         )
 
     # Proxy KL gradients are linear in the upstream scalar.  Keep the kernel
@@ -156,8 +177,8 @@ def run_warmup_backward(
 
     from flash_msa.msa_backward_cutedsl import _derive_head_tiling, run_fused_backward
 
-    _main_per_proxy, query_chunk, _rows_per_task, _proxy_query_rows = _derive_head_tiling(
-        n_heads, n_kv_heads, n_proxy_heads
+    _main_per_proxy, query_chunk, _rows_per_task, _proxy_query_rows = (
+        _derive_head_tiling(n_heads, n_kv_heads, n_proxy_heads)
     )
     task_meta, task_qids = _dense_causal_schedule(
         batch=batch,
@@ -166,7 +187,9 @@ def run_warmup_backward(
         query_chunk=query_chunk,
         device=q.device,
     )
-    lse_proxy = _run_proxy_lse_flash(q_proxy, k_proxy, scale=float(scale))
+    lse_proxy = _run_proxy_lse_flash(
+        q_proxy, k_proxy, scale=float(scale), document_ids=document_ids
+    )
     delta_main = (o_main.float() * grad_o_main.float()).sum(dim=-1)
 
     dq_proxy, dk_proxy, dq, dk, dv = run_fused_backward(
@@ -181,6 +204,7 @@ def run_warmup_backward(
         delta_main,
         task_meta,
         task_qids,
+        document_ids,
         scale=float(scale),
         grad_kl_scale=proxy_grad_scale,
     )

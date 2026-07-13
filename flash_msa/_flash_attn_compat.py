@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from functools import lru_cache
 
 import torch
@@ -48,6 +49,8 @@ def flash_attn_varlen_paged_forward(
     max_seqlen_k: int,
     softmax_scale: float,
     causal: bool,
+    mask_mod: Callable | None = None,
+    aux_tensors: list[torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     """Use FA4 paged varlen forward, or return ``None`` on FA3 installs."""
 
@@ -65,6 +68,8 @@ def flash_attn_varlen_paged_forward(
         max_seqlen_k=max_seqlen_k,
         softmax_scale=softmax_scale,
         causal=causal,
+        mask_mod=mask_mod,
+        aux_tensors=aux_tensors,
         return_lse=True,
     )
     return out, lse
@@ -81,11 +86,15 @@ def flash_attn_varlen_forward(
     max_seqlen_k: int,
     softmax_scale: float,
     causal: bool,
+    mask_mod: Callable | None = None,
+    aux_tensors: list[torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return ``(out, lse)`` for FlashAttention 3 or 4."""
 
     flash_attn_varlen_func = _fa3_varlen_func()
     if flash_attn_varlen_func is not None:
+        if mask_mod is not None:
+            raise NotImplementedError("document masking requires FlashAttention 4")
         out, lse = flash_attn_varlen_func(
             q,
             k,
@@ -116,6 +125,8 @@ def flash_attn_varlen_forward(
         max_seqlen_k=max_seqlen_k,
         softmax_scale=softmax_scale,
         causal=causal,
+        mask_mod=mask_mod,
+        aux_tensors=aux_tensors,
         return_lse=True,
     )
     return out, lse
