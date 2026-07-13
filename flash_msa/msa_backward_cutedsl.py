@@ -29,6 +29,11 @@ def _to_cute_tensor(tensor: torch.Tensor) -> cute.Tensor:
     return from_dlpack(tensor.detach(), assumed_align=16)
 
 
+@dsl_user_op
+def _exit_thread(*, loc=None, ip=None) -> None:
+    nvvm.exit()
+
+
 def _derive_head_tiling(
     n_heads: int, n_kv_heads: int, n_proxy_heads: int
 ) -> tuple[int, int, int, int]:
@@ -355,6 +360,8 @@ class _MSAFusedBackwardMMAKernel:
         query_count = cutlass.min(
             Int32(self.query_chunk), task_meta[task_idx, 3] - qid_base
         )
+        if query_count <= Int32(0):
+            _exit_thread()
         kv_head = proxy_head // Int32(self.proxy_heads_per_kv)
         proxy_kv_head = proxy_head // Int32(self.proxy_groups)
 
@@ -444,6 +451,36 @@ class _MSAFusedBackwardMMAKernel:
         cKV = cute.make_identity_tensor((KEY_SLICE_SIZE, self.head_dim_padded))
         tKVcKV_mn = _make_acc_tensor_mn_view(thr_dkv.partition_C(cKV))
 
+        q_linear = tidx
+        while q_linear < Int32(self.rows_per_task * self.head_dim):
+            row = q_linear // Int32(self.head_dim)
+            dim = q_linear - row * Int32(self.head_dim)
+            q_slot = row // Int32(self.main_per_proxy)
+            head_offset = row - q_slot * Int32(self.main_per_proxy)
+            if q_slot < query_count:
+                q_pos = task_qids[task_idx, qid_base + q_slot]
+                head = proxy_head * Int32(self.main_per_proxy) + head_offset
+                sQ[row, dim] = q[batch, head, q_pos, dim]
+                sdO[row, dim] = grad_o_main[batch, head, q_pos, dim]
+            else:
+                sQ[row, dim] = zero
+                sdO[row, dim] = zero
+            q_linear += Int32(self.num_threads)
+
+        if grad_kl_scale != Float32(0.0):
+            px_q_linear = tidx
+            while px_q_linear < Int32(self.proxy_query_rows * self.head_dim):
+                row = px_q_linear // Int32(self.head_dim)
+                dim = px_q_linear - row * Int32(self.head_dim)
+                if row < query_count:
+                    q_pos = task_qids[task_idx, qid_base + row]
+                    sQpx[row, dim] = q_proxy[batch, proxy_head, q_pos, dim]
+                else:
+                    sQpx[row, dim] = zero
+                px_q_linear += Int32(self.num_threads)
+
+        cute.arch.sync_threads()
+
         for key_slice in cutlass.range_constexpr(KEY_SLICES):
             kv_linear = tidx
             while kv_linear < Int32(KEY_SLICE_SIZE * self.head_dim):
@@ -470,24 +507,6 @@ class _MSAFusedBackwardMMAKernel:
                     )
                     sKpx[row, dim] = k_proxy[batch, proxy_kv_head, key_pos, dim]
                     px_k_linear += Int32(self.num_threads)
-
-            cute.arch.sync_threads()
-
-            q_linear = tidx
-            while q_linear < Int32(self.rows_per_task * self.head_dim):
-                row = q_linear // Int32(self.head_dim)
-                dim = q_linear - row * Int32(self.head_dim)
-                q_slot = row // Int32(self.main_per_proxy)
-                head_offset = row - q_slot * Int32(self.main_per_proxy)
-                if q_slot < query_count:
-                    q_pos = task_qids[task_idx, qid_base + q_slot]
-                    head = proxy_head * Int32(self.main_per_proxy) + head_offset
-                    sQ[row, dim] = q[batch, head, q_pos, dim]
-                    sdO[row, dim] = grad_o_main[batch, head, q_pos, dim]
-                else:
-                    sQ[row, dim] = zero
-                    sdO[row, dim] = zero
-                q_linear += Int32(self.num_threads)
 
             cute.arch.sync_threads()
 
@@ -715,19 +734,6 @@ class _MSAFusedBackwardMMAKernel:
                     (KEY_SLICE_SIZE, self.head_dim_padded)
                 )
                 tPxcDK_mn = _make_acc_tensor_mn_view(thr_px.partition_C(cPxDK))
-
-                px_q_linear = tidx
-                while px_q_linear < Int32(self.proxy_query_rows * self.head_dim):
-                    row = px_q_linear // Int32(self.head_dim)
-                    dim = px_q_linear - row * Int32(self.head_dim)
-                    if row < query_count:
-                        q_pos = task_qids[task_idx, qid_base + row]
-                        sQpx[row, dim] = q_proxy[batch, proxy_head, q_pos, dim]
-                    else:
-                        sQpx[row, dim] = zero
-                    px_q_linear += Int32(self.num_threads)
-
-                cute.arch.sync_threads()
 
                 acc_shape_px = thr_px.partition_shape_C(
                     (self.proxy_query_rows, KEY_SLICE_SIZE)
