@@ -119,6 +119,32 @@ def _local_block_attention(
     )
 
 
+@torch.compile(fullgraph=True, dynamic=False)
+def _merge_remote_output(
+    local_output: torch.Tensor,
+    local_weight: torch.Tensor,
+    remote_output: torch.Tensor,
+    remote_weight: torch.Tensor,
+    valid: torch.Tensor,
+    destination: torch.Tensor,
+    denominator: torch.Tensor,
+) -> torch.Tensor:
+    remote_weighted = torch.where(
+        valid[:, None, None],
+        remote_output.float() * remote_weight[..., None],
+        0.0,
+    )
+    destination_output = destination[:, None, None].expand_as(remote_weighted)
+    return (
+        (local_output * local_weight[..., None]).scatter_add(
+            0,
+            destination_output,
+            remote_weighted,
+        )
+        / denominator[..., None]
+    )
+
+
 def sparse_flash_varlen_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -291,15 +317,15 @@ def sparse_flash_varlen_forward(
         if local_output is None:
             output = None
         else:
-            remote_weighted = remote_output.float() * remote_weight[..., None]
-            remote_weighted = remote_weighted.masked_fill(~valid[:, None, None], 0.0)
-            output = local_output * local_weight[..., None]
-            output = output.scatter_add(
-                0,
-                destination[:, None, None].expand_as(remote_weighted),
-                remote_weighted,
+            output = _merge_remote_output(
+                local_output,
+                local_weight,
+                remote_output,
+                remote_weight,
+                valid,
+                destination,
+                denominator,
             )
-            output = output / denominator[..., None]
 
     lse = (
         lse.view(batch, n_proxy_heads, seq_len, main_per_proxy)

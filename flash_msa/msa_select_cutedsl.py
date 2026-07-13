@@ -331,7 +331,8 @@ class _MSASelectBlocksKernel:
                 local_block = q_pos // Int32(BLOCK_SIZE)
                 if row_is_valid and key_block == local_block:
                     score = cutlass.Float32.inf
-                self._insert_topk(top_vals, top_idx, rr, score, key_block)
+                if score != -cutlass.Float32.inf:
+                    self._insert_topk(top_vals, top_idx, rr, score, key_block)
 
             key_block += Int32(1)
 
