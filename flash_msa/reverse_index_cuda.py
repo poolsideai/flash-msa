@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import sys
 from dataclasses import dataclass, field
 
@@ -33,9 +34,17 @@ def _load_ext():
                 os.environ["PATH"] = os.pathsep.join(
                     [python_bin, os.environ.get("PATH", "")]
                 )
+        try:
+            import nvidia.cu13
+        except ModuleNotFoundError:
+            extra_include_paths = None
+        else:
+            include_dir = Path(next(iter(nvidia.cu13.__path__))) / "include"
+            extra_include_paths = [str(include_dir)] if include_dir.is_dir() else None
         _EXT = load(
             name="msa_reverse_index_ext",
             sources=[_SRC],
+            extra_include_paths=extra_include_paths,
             extra_cflags=["-O3"],
             extra_cuda_cflags=[
                 "-O3",
@@ -181,6 +190,46 @@ def build_reverse_index_cuda(
     return ws["task_meta"], ws["task_qids"]
 
 
+def build_dense_causal_schedule_cuda(
+    *,
+    batch: int,
+    n_proxy_heads: int,
+    seq_len: int,
+    query_chunk: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build dense causal backward tasks without per-task host work."""
+
+    if device.type != "cuda":
+        raise ValueError("dense schedule builder requires a CUDA device")
+    if seq_len % BLOCK_SIZE:
+        raise ValueError(f"sequence length must be divisible by {BLOCK_SIZE}")
+    if batch < 1 or n_proxy_heads < 1 or query_chunk < 1:
+        raise ValueError("batch, n_proxy_heads, and query_chunk must be positive")
+
+    num_blocks = seq_len // BLOCK_SIZE
+    offsets = [0]
+    for _ in range(batch * n_proxy_heads):
+        for key_block in range(num_blocks):
+            queries = seq_len - key_block * BLOCK_SIZE
+            offsets.append(offsets[-1] + (queries + query_chunk - 1) // query_chunk)
+
+    bucket_offsets = torch.tensor(offsets, dtype=torch.int64, device=device)
+    num_tasks = offsets[-1]
+    task_meta = torch.empty((num_tasks, 4), dtype=torch.int32, device=device)
+    task_qids = torch.empty((num_tasks, query_chunk), dtype=torch.int32, device=device)
+    _load_ext().run_build_dense_schedule(
+        bucket_offsets,
+        task_meta,
+        task_qids,
+        int(n_proxy_heads),
+        int(num_blocks),
+        int(seq_len),
+        int(query_chunk),
+    )
+    return task_meta, task_qids
+
+
 def build_sparse_attention_metadata_cuda(
     block_indices: torch.Tensor,
     *,
@@ -265,6 +314,7 @@ def build_sparse_attention_metadata_cuda(
 __all__ = [
     "ReverseIndexWorkspace",
     "SparseAttentionMetadata",
+    "build_dense_causal_schedule_cuda",
     "build_reverse_index_cuda",
     "build_sparse_attention_metadata_cuda",
 ]

@@ -2,6 +2,39 @@ import pytest
 import torch
 
 from flash_msa import flash_msa_func, flash_msa_warmup_func
+from flash_msa.reverse_index_cuda import build_dense_causal_schedule_cuda
+
+
+def test_dense_warmup_schedule_is_built_on_cuda() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+
+    task_meta, task_qids = build_dense_causal_schedule_cuda(
+        batch=2,
+        n_proxy_heads=2,
+        seq_len=256,
+        query_chunk=16,
+        device=torch.device("cuda"),
+    )
+
+    assert task_meta.shape == (96, 4)
+    for batch in range(2):
+        for head in range(2):
+            for block in range(2):
+                matches = task_meta[:, :3] == torch.tensor(
+                    [batch, head, block],
+                    device="cuda",
+                )
+                rows = matches.all(dim=1).nonzero().flatten()
+                actual = task_qids[rows].flatten()
+                actual = actual[actual >= 0]
+                expected = torch.arange(
+                    block * 128,
+                    256,
+                    device="cuda",
+                    dtype=torch.int32,
+                )
+                torch.testing.assert_close(actual, expected)
 
 
 @pytest.mark.parametrize("kernel", [flash_msa_func, flash_msa_warmup_func])

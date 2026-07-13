@@ -43,25 +43,15 @@ def _dense_causal_schedule(
     if key in _SCHEDULE_CACHE:
         return _SCHEDULE_CACHE[key]
 
-    num_blocks = int(seq_len) // BLOCK_SIZE
-    meta_rows: list[list[int]] = []
-    qid_rows: list[torch.Tensor] = []
+    from flash_msa.reverse_index_cuda import build_dense_causal_schedule_cuda
 
-    for bidx in range(int(batch)):
-        for proxy_head in range(int(n_proxy_heads)):
-            for key_block in range(num_blocks):
-                query_start = key_block * BLOCK_SIZE
-                qids = torch.arange(query_start, int(seq_len), dtype=torch.int32)
-                for start in range(0, int(qids.numel()), int(query_chunk)):
-                    chunk = qids[start : start + int(query_chunk)]
-                    valid = int(chunk.numel())
-                    qid_row = torch.full((int(query_chunk),), -1, dtype=torch.int32)
-                    qid_row[:valid] = chunk
-                    meta_rows.append([bidx, proxy_head, key_block, valid])
-                    qid_rows.append(qid_row)
-
-    task_meta = torch.tensor(meta_rows, dtype=torch.int32, device=device)
-    task_qids = torch.stack(qid_rows, dim=0).to(device=device, non_blocking=True)
+    task_meta, task_qids = build_dense_causal_schedule_cuda(
+        batch=int(batch),
+        n_proxy_heads=int(n_proxy_heads),
+        seq_len=int(seq_len),
+        query_chunk=int(query_chunk),
+        device=device,
+    )
     _SCHEDULE_CACHE[key] = (task_meta, task_qids)
     return task_meta, task_qids
 
@@ -96,7 +86,11 @@ def _run_proxy_lse_flash(
 ) -> torch.Tensor:
     """Compute dense causal proxy LSE for the KL-gradient branch."""
 
-    from flash_msa._flash_attn_compat import flash_attn_varlen_forward
+    from flash_msa._flash_attn_compat import (
+        flash_attn_supports_narrow_value_dim,
+        flash_attn_varlen_forward,
+    )
+    from flash_msa.sparse_flash_varlen import _lse_value_dim
 
     batch, n_proxy_heads, seq_len, head_dim = q_proxy.shape
     n_proxy_kv_heads = k_proxy.shape[1]
@@ -116,10 +110,18 @@ def _run_proxy_lse_flash(
 
     from flash_msa.sparse_flash_varlen import _causal_document_mask
 
+    if flash_attn_supports_narrow_value_dim():
+        value = torch.zeros(
+            (*k_pack.shape[:-1], _lse_value_dim(k_proxy.device)),
+            device=k_proxy.device,
+            dtype=k_proxy.dtype,
+        )
+    else:
+        value = k_pack
     _out, lse = flash_attn_varlen_forward(
         q=q_pack,
         k=k_pack,
-        v=k_pack,
+        v=value,
         cu_seqlens_q=cu_seqlens,
         cu_seqlens_k=cu_seqlens,
         max_seqlen_q=int(seq_len),
@@ -184,7 +186,7 @@ def run_warmup_backward(
         batch=batch,
         n_proxy_heads=n_proxy_heads,
         seq_len=seq_len,
-        query_chunk=query_chunk,
+        query_chunk=2 * query_chunk,
         device=q.device,
     )
     lse_proxy = _run_proxy_lse_flash(

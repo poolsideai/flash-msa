@@ -199,6 +199,52 @@ __global__ void scatter_remote_slots_kernel(
     }
 }
 
+__global__ void fill_dense_schedule_kernel(
+    int64_t const* __restrict__ bucket_offsets,
+    int* __restrict__ task_meta,
+    int* __restrict__ task_qids,
+    int64_t num_tasks,
+    int buckets,
+    int Hp,
+    int NB,
+    int S,
+    int query_chunk)
+{
+    int64_t stride = (int64_t)blockDim.x * gridDim.x;
+    for (int64_t task = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+         task < num_tasks;
+         task += stride) {
+        int low = 0;
+        int high = buckets;
+        while (low + 1 < high) {
+            int middle = (low + high) / 2;
+            if (bucket_offsets[middle] <= task) {
+                low = middle;
+            } else {
+                high = middle;
+            }
+        }
+
+        int bucket = low;
+        int key_block = bucket % NB;
+        int tmp = bucket / NB;
+        int proxy_head = tmp % Hp;
+        int batch = tmp / Hp;
+        int64_t local_task = task - bucket_offsets[bucket];
+        int query_start = key_block * 128 + (int)local_task * query_chunk;
+        int valid = min(query_chunk, S - query_start);
+
+        int64_t meta_row = task * 4;
+        task_meta[meta_row + 0] = batch;
+        task_meta[meta_row + 1] = proxy_head;
+        task_meta[meta_row + 2] = key_block;
+        task_meta[meta_row + 3] = valid;
+        for (int lane = 0; lane < query_chunk; ++lane) {
+            task_qids[task * query_chunk + lane] = lane < valid ? query_start + lane : -1;
+        }
+    }
+}
+
 } // namespace
 
 void run_build_reverse_index(
@@ -345,7 +391,46 @@ void run_build_remote_layout(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+void run_build_dense_schedule(
+    torch::Tensor bucket_offsets,
+    torch::Tensor task_meta,
+    torch::Tensor task_qids,
+    int64_t proxy_heads,
+    int64_t num_blocks,
+    int64_t seq_len,
+    int64_t query_chunk)
+{
+    CHECK_CUDA(bucket_offsets);
+    CHECK_CONTIGUOUS(bucket_offsets);
+    CHECK_INPUT(task_meta);
+    CHECK_INPUT(task_qids);
+    TORCH_CHECK(bucket_offsets.scalar_type() == at::kLong, "bucket_offsets must be int64");
+    TORCH_CHECK(task_meta.dim() == 2 && task_meta.size(1) == 4, "task_meta must have shape [T, 4]");
+    TORCH_CHECK(task_qids.dim() == 2 && task_qids.size(1) == query_chunk, "task_qids must have shape [T, query_chunk]");
+    TORCH_CHECK(task_meta.size(0) == task_qids.size(0), "dense schedule task rows must match");
+    TORCH_CHECK(bucket_offsets.numel() > 1, "dense schedule needs at least one bucket");
+
+    int buckets = (int)bucket_offsets.numel() - 1;
+    TORCH_CHECK(buckets % (proxy_heads * num_blocks) == 0, "dense schedule bucket count is invalid");
+    int64_t num_tasks = task_meta.size(0);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    int blocks = (int)std::min<int64_t>((num_tasks + kThreads - 1) / kThreads, 65535);
+    blocks = std::max(blocks, 1);
+    fill_dense_schedule_kernel<<<blocks, kThreads, 0, stream>>>(
+        bucket_offsets.data_ptr<int64_t>(),
+        task_meta.data_ptr<int>(),
+        task_qids.data_ptr<int>(),
+        num_tasks,
+        buckets,
+        (int)proxy_heads,
+        (int)num_blocks,
+        (int)seq_len,
+        (int)query_chunk);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("run_build_reverse_index", &run_build_reverse_index, "Build MSA reverse index on CUDA");
     m.def("run_build_remote_layout", &run_build_remote_layout, "Build the MSA remote varlen layout on CUDA");
+    m.def("run_build_dense_schedule", &run_build_dense_schedule, "Build the dense MSA backward schedule on CUDA");
 }
