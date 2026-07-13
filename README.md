@@ -54,19 +54,38 @@ attn_out, kl_loss = flash_msa_func(
 
 or
 ```
-from flash_msa import flash_msa_warmup
+from flash_msa import flash_msa_warmup_func
 attn_out, kl_loss = flash_msa_warmup_func(Q_proxy, K_proxy, Q, K, V, top_k, head_dim ** -0.5)
 ```
 
 Note that kl_loss in the forward is just a torch.zeros placeholder, but after adding it to the main model loss, calling backward() will activate the on-the-fly gradient calcs equivalent to the actual proxy KL loss signal.
 
+To log the actual KL without materializing attention probabilities, pass a scalar FP32
+CUDA buffer. The fused backward updates it with the unweighted KL value:
+
+```
+kl_metric = torch.zeros((), device=Q.device, dtype=torch.float32)
+attn_out, kl_loss = flash_msa_func(
+    Q_proxy,
+    K_proxy,
+    Q,
+    K,
+    V,
+    top_k,
+    head_dim ** -0.5,
+    kl_metric=kl_metric,
+)
+loss = model_loss + kl_weight * kl_loss
+loss.backward()
+```
+
 # Caveats
 
 1. Flash-MSA only supports headdims 128, block size 128.
-2. Flash-MSA does not currently return fully materialized KL div. loss term in the fwd/bwd (see [blog](https://nanduruganesh.github.io/flash-msa) for explanation).
+2. Flash-MSA does not return a materialized KL tensor. It can optionally accumulate the scalar KL during backward.
 3. No support for quantized training (fp8, nvfp4, mxfp4).
 4. No support for attn temps / oai-style softmax bias.
-5. Proxy Q is grouped by Main KV so Q_p <= KV heads for now.
+5. The proxy-head count must be at least and divisible by the Main KV-head count.
 
 These are not ridiculous to implement though so if there is demand or if someone makes a PR, I will update the repo to include these features.
 
@@ -80,7 +99,7 @@ Test warmup MSA correctness against an eager implementation of MSA: `python test
 
 An MSA training example is implemented in this [Megatron-LM fork](https://github.com/nanduruganesh/Megatron-LM). 
 
-Notably, you must add the kl_loss returned by MSA kernels to the model's main CE loss before backward to train the proxy attention. The kl_loss is currently treated as a torch.zeros` placeholder and calculated on-the-fly in the backward, so logging the kl_loss will not reflect how proxy training is actually going. Some solutions to get some signal on proxy training are logging grad/update norms of proxy weights, or patching the forward kernel to calculate and accumulate KL div, but only doing this once every n steps to amortize how slow this would make the forward.
+Notably, you must add the kl_loss returned by MSA kernels to the model's main CE loss before backward to train the proxy attention. The kl_loss is a torch.zeros placeholder and calculated on-the-fly in the backward, so logging that placeholder will not reflect how proxy training is actually going. Pass kl_metric when the actual scalar KL is needed.
 
 In general if you are going to train with this it is highly recommended to follow tips from [the paper](https://arxiv.org/abs/2606.13392), use MSA warmup before turning on MSA sparse training, and replicate any transformations to the main attention queries and keys (RoPE, QK norm, QK clip, etc) to the proxy queries and keys to improve proxy convergence.
 

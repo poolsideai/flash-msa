@@ -136,6 +136,7 @@ class _MSAFusedBackwardMMAKernel:
         num_tasks: int,
         input_query_chunk: int,
         has_document_mask: bool,
+        record_kl_metric: bool,
         num_threads: int = 256,
     ) -> None:
         if head_dim != 128:
@@ -154,6 +155,7 @@ class _MSAFusedBackwardMMAKernel:
         self.proxy_groups = int(n_proxy_heads) // int(n_proxy_kv_heads)
         self.input_query_chunk = int(input_query_chunk)
         self.has_document_mask = bool(has_document_mask)
+        self.record_kl_metric = bool(record_kl_metric)
         if self.input_query_chunk % query_chunk != 0:
             raise NotImplementedError(
                 "fused backward input task query width must be divisible by "
@@ -183,8 +185,10 @@ class _MSAFusedBackwardMMAKernel:
         dq: cute.Tensor,
         dk: cute.Tensor,
         dv: cute.Tensor,
+        kl_metric: cute.Tensor,
         softmax_scale: cutlass.Float32,
         grad_kl_scale: cutlass.Float32,
+        kl_metric_scale: cutlass.Float32,
         stream: cuda.CUstream,
     ):
         if cutlass.const_expr(
@@ -299,10 +303,12 @@ class _MSAFusedBackwardMMAKernel:
             dq,
             dk,
             dv,
+            kl_metric,
             softmax_scale,
             softmax_scale * Float32(LOG2_E),
             Float32(LOG2_E),
             grad_kl_scale,
+            kl_metric_scale,
             sQ_layout,
             sKV_layout,
             sPdS_layout,
@@ -337,10 +343,12 @@ class _MSAFusedBackwardMMAKernel:
         dq: cute.Tensor,
         dk: cute.Tensor,
         dv: cute.Tensor,
+        kl_metric: cute.Tensor,
         softmax_scale: cutlass.Float32,
         softmax_scale_log2: cutlass.Float32,
         log2_e: cutlass.Float32,
         grad_kl_scale: cutlass.Float32,
+        kl_metric_scale: cutlass.Float32,
         sQ_layout: cute.ComposedLayout,
         sKV_layout: cute.ComposedLayout,
         sPdS_layout: cute.ComposedLayout,
@@ -387,6 +395,8 @@ class _MSAFusedBackwardMMAKernel:
         sdSt = _transpose_view(sdS)
 
         zero = Float32(0.0).to(self._dtype)
+        kl_acc = Float32(0.0)
+        proxy_compute_scale = grad_kl_scale + kl_metric_scale
 
         copy_atom = cute.make_copy_atom(
             warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4), self._dtype
@@ -471,7 +481,7 @@ class _MSAFusedBackwardMMAKernel:
                 sdO[row, dim] = zero
             q_linear += Int32(self.num_threads)
 
-        if grad_kl_scale != Float32(0.0):
+        if proxy_compute_scale != Float32(0.0):
             px_q_linear = tidx
             while px_q_linear < Int32(self.proxy_query_rows * self.head_dim):
                 row = px_q_linear // Int32(self.head_dim)
@@ -499,7 +509,7 @@ class _MSAFusedBackwardMMAKernel:
                 sV[row, dim] = v[batch, kv_head, key_pos, dim]
                 kv_linear += Int32(self.num_threads)
 
-            if grad_kl_scale != Float32(0.0):
+            if proxy_compute_scale != Float32(0.0):
                 px_k_linear = tidx
                 while px_k_linear < Int32(KEY_SLICE_SIZE * self.head_dim):
                     row = px_k_linear // Int32(self.head_dim)
@@ -683,7 +693,7 @@ class _MSAFusedBackwardMMAKernel:
                 softmax_scale,
             )
 
-            if grad_kl_scale != Float32(0.0):
+            if proxy_compute_scale != Float32(0.0):
                 thr_px = tiled_mma_px.get_slice(tidx)
                 copy_A_px = cute.make_tiled_copy_A(copy_atom, tiled_mma_px).get_slice(
                     tidx
@@ -802,6 +812,15 @@ class _MSAFusedBackwardMMAKernel:
                                     ]
                                 )
                             teacher = teacher * Float32(1.0 / self.main_per_proxy)
+                            if cutlass.const_expr(self.record_kl_metric):
+                                if teacher > Float32(0.0):
+                                    kl_acc = kl_acc + kl_metric_scale * teacher * (
+                                        cute.math.log(teacher, fastmath=True)
+                                        - (
+                                            acc_Px_mn[rr, cc] * softmax_scale
+                                            - lse_px
+                                        )
+                                    )
                             ds_px = grad_kl_scale * (p_px - teacher)
                         acc_Px_mn[rr, cc] = ds_px
 
@@ -882,6 +901,11 @@ class _MSAFusedBackwardMMAKernel:
                 )
 
             cute.arch.sync_threads()
+
+        if cutlass.const_expr(self.record_kl_metric):
+            kl_acc = cute.arch.warp_reduction_sum(kl_acc)
+            if tidx % Int32(32) == Int32(0):
+                _atomic_add_fp32(kl_acc, kl_metric.iterator)
 
     @cute.jit
     def _atomic_main_dq(
@@ -1007,6 +1031,7 @@ def _compile_fused_backward_kernel(
     num_tasks: int,
     input_query_chunk: int,
     has_document_mask: bool,
+    record_kl_metric: bool,
     q_proxy: cute.Tensor,
     k_proxy: cute.Tensor,
     q: cute.Tensor,
@@ -1024,8 +1049,10 @@ def _compile_fused_backward_kernel(
     dq: cute.Tensor,
     dk: cute.Tensor,
     dv: cute.Tensor,
+    kl_metric: cute.Tensor,
     softmax_scale: float,
     grad_kl_scale: float,
+    kl_metric_scale: float,
     stream: cuda.CUstream,
 ):
     num_threads = 256
@@ -1048,6 +1075,7 @@ def _compile_fused_backward_kernel(
         int(num_tasks),
         int(input_query_chunk),
         bool(has_document_mask),
+        bool(record_kl_metric),
         int(num_threads),
         q_proxy.element_type,
         k_proxy.element_type,
@@ -1066,6 +1094,7 @@ def _compile_fused_backward_kernel(
         dq.element_type,
         dk.element_type,
         dv.element_type,
+        kl_metric.element_type,
     )
     if key not in _COMPILE_CACHE:
         kernel = _MSAFusedBackwardMMAKernel(
@@ -1079,6 +1108,7 @@ def _compile_fused_backward_kernel(
             num_tasks=num_tasks,
             input_query_chunk=input_query_chunk,
             has_document_mask=has_document_mask,
+            record_kl_metric=record_kl_metric,
             num_threads=num_threads,
         )
         _COMPILE_CACHE[key] = cute.compile(
@@ -1100,8 +1130,10 @@ def _compile_fused_backward_kernel(
             dq,
             dk,
             dv,
+            kl_metric,
             float(softmax_scale),
             float(grad_kl_scale),
+            float(kl_metric_scale),
             stream,
         )
     return _COMPILE_CACHE[key]
@@ -1120,9 +1152,12 @@ def _run_fused_backward_impl(
     task_meta: torch.Tensor,
     task_qids: torch.Tensor,
     document_ids: torch.Tensor,
+    kl_metric: torch.Tensor,
     *,
     scale: float,
     grad_kl_scale: float,
+    kl_metric_scale: float,
+    record_kl_metric: bool,
     cast_outputs: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if q.device.type != "cuda":
@@ -1142,6 +1177,7 @@ def _run_fused_backward_impl(
     task_meta_c = task_meta.detach().to(torch.int32).contiguous()
     task_qids_c = task_qids.detach().to(torch.int32).contiguous()
     document_ids_c = document_ids.detach().to(torch.int32).contiguous()
+    assert kl_metric.shape == () and kl_metric.dtype == torch.float32
 
     batch, n_heads, seq_len, head_dim = q_c.shape
     _, n_kv_heads, _, _ = k_c.shape
@@ -1184,6 +1220,7 @@ def _run_fused_backward_impl(
     dq_t = _to_cute_tensor(dq)
     dk_t = _to_cute_tensor(dk)
     dv_t = _to_cute_tensor(dv)
+    kl_metric_t = _to_cute_tensor(kl_metric)
     stream = cuda.CUstream(torch.cuda.current_stream(q_c.device).cuda_stream)
 
     compiled = _compile_fused_backward_kernel(
@@ -1197,6 +1234,7 @@ def _run_fused_backward_impl(
         num_tasks,
         input_query_chunk,
         bool(document_ids_c.numel()),
+        record_kl_metric,
         q_proxy_t,
         k_proxy_t,
         q_t,
@@ -1214,8 +1252,10 @@ def _run_fused_backward_impl(
         dq_t,
         dk_t,
         dv_t,
+        kl_metric_t,
         float(scale),
         float(grad_kl_scale),
+        float(kl_metric_scale),
         stream,
     )
     compiled(
@@ -1236,8 +1276,10 @@ def _run_fused_backward_impl(
         dq_t,
         dk_t,
         dv_t,
+        kl_metric_t,
         float(scale),
         float(grad_kl_scale),
+        float(kl_metric_scale),
         stream,
     )
 
@@ -1266,9 +1308,12 @@ def run_fused_backward(
     task_meta: torch.Tensor,
     task_qids: torch.Tensor,
     document_ids: torch.Tensor,
+    kl_metric: torch.Tensor,
     *,
     scale: float,
     grad_kl_scale: float,
+    kl_metric_scale: float,
+    record_kl_metric: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
     return _run_fused_backward_impl(
@@ -1284,6 +1329,9 @@ def run_fused_backward(
         task_meta,
         task_qids,
         document_ids,
+        kl_metric,
         scale=scale,
         grad_kl_scale=grad_kl_scale,
+        kl_metric_scale=kl_metric_scale,
+        record_kl_metric=record_kl_metric,
     )

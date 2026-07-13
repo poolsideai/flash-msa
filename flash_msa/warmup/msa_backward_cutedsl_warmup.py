@@ -145,8 +145,10 @@ def run_warmup_backward(
     grad_out: torch.Tensor | None,
     grad_kl: torch.Tensor | None,
     document_ids: torch.Tensor,
+    kl_metric: torch.Tensor,
     *,
     scale: float,
+    record_kl_metric: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run tiled CuTeDSL backward over the full causal block schedule."""
 
@@ -207,8 +209,15 @@ def run_warmup_backward(
         task_meta,
         task_qids,
         document_ids,
+        kl_metric,
         scale=float(scale),
         grad_kl_scale=proxy_grad_scale,
+        kl_metric_scale=(
+            1.0 / float(batch * n_proxy_heads * seq_len)
+            if record_kl_metric
+            else 0.0
+        ),
+        record_kl_metric=record_kl_metric,
     )
     if grad_kl is not None:
         proxy_multiplier = grad_kl.detach().to(device=q.device, dtype=dq_proxy.dtype)

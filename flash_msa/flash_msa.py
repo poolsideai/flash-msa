@@ -86,8 +86,10 @@ def _run_fused_selected_edge_backward(
     grad_o_main: torch.Tensor,
     grad_kl: torch.Tensor | None,
     metadata: SparseAttentionMetadata,
+    kl_metric: torch.Tensor,
     *,
     scale: float,
+    record_kl_metric: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run the native reverse-index fused selected-edge backward."""
 
@@ -101,7 +103,7 @@ def _run_fused_selected_edge_backward(
             scale=float(scale),
             metadata=metadata,
         )
-        if grad_kl is not None
+        if grad_kl is not None or record_kl_metric
         else torch.empty(
             (bsz, n_proxy_heads, seq_len),
             device=q.device,
@@ -114,9 +116,8 @@ def _run_fused_selected_edge_backward(
     # kernel at the static normalization scale, then apply the CUDA scalar to
     # only the proxy gradients.  This avoids the synchronizing ``.item()`` that
     # would otherwise be needed for a by-value CuTeDSL kernel argument.
-    proxy_grad_scale = (
-        0.0 if grad_kl is None else 1.0 / float(bsz * n_proxy_heads * seq_len)
-    )
+    normalization = 1.0 / float(bsz * n_proxy_heads * seq_len)
+    proxy_grad_scale = 0.0 if grad_kl is None else normalization
     dq_proxy, dk_proxy, dq, dk, dv = run_fused_backward(
         q_proxy,
         k_proxy,
@@ -130,8 +131,11 @@ def _run_fused_selected_edge_backward(
         metadata.task_meta,
         metadata.task_qids,
         metadata.document_ids,
+        kl_metric,
         scale=float(scale),
         grad_kl_scale=proxy_grad_scale,
+        kl_metric_scale=normalization if record_kl_metric else 0.0,
+        record_kl_metric=record_kl_metric,
     )
     if grad_kl is not None:
         proxy_multiplier = grad_kl.detach().to(device=q.device, dtype=dq_proxy.dtype)
@@ -152,6 +156,8 @@ class _SparseAttentionFunction(torch.autograd.Function):
         top_k: int,
         scale: float,
         document_ids: torch.Tensor,
+        kl_metric: torch.Tensor,
+        record_kl_metric: bool,
     ):
         b, n_proxy_heads, s, head_dim = q_proxy.shape
         n_heads = q.shape[1]
@@ -206,6 +212,10 @@ class _SparseAttentionFunction(torch.autograd.Function):
         )
         ctx.save_for_backward(*save_tensors)
         ctx.scale = float(scale)
+        ctx.kl_metric = kl_metric
+        ctx.record_kl_metric = bool(record_kl_metric)
+        if ctx.record_kl_metric:
+            kl_metric.zero_()
         ctx.metadata_shape = (
             metadata.batch,
             metadata.n_proxy_heads,
@@ -271,9 +281,11 @@ class _SparseAttentionFunction(torch.autograd.Function):
             grad_o_main,
             grad_kl,
             metadata,
+            ctx.kl_metric,
             scale=ctx.scale,
+            record_kl_metric=ctx.record_kl_metric,
         )
-        return dq_proxy, dk_proxy, dq, dk, dv, None, None, None
+        return dq_proxy, dk_proxy, dq, dk, dv, None, None, None, None, None
 
 
 def sparse_attention(
@@ -287,6 +299,7 @@ def sparse_attention(
     document_list: torch.Tensor | None = None,
     *,
     cu_seqlens: torch.Tensor | None = None,
+    kl_metric: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return the attention output and the proxy-KL autograd placeholder.
 
@@ -304,6 +317,11 @@ def sparse_attention(
         )
     if document_list is None:
         document_list = torch.empty(0, device=q.device, dtype=torch.int32)
+    record_kl_metric = kl_metric is not None
+    if kl_metric is None:
+        kl_metric = torch.empty((), device=q.device, dtype=torch.float32)
+    else:
+        assert kl_metric.shape == () and kl_metric.dtype == torch.float32
     return _SparseAttentionFunction.apply(
         q_proxy,
         k_proxy,
@@ -313,4 +331,6 @@ def sparse_attention(
         int(top_k),
         float(scale),
         document_list,
+        kl_metric,
+        record_kl_metric,
     )

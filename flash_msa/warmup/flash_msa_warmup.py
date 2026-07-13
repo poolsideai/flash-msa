@@ -63,6 +63,8 @@ class _WarmupSparseAttentionFunction(torch.autograd.Function):
         top_k: int,
         scale: float,
         document_ids: torch.Tensor,
+        kl_metric: torch.Tensor,
+        record_kl_metric: bool,
     ):
         _ = int(top_k)
         _validate_inputs(q_proxy, k_proxy, q, k, v)
@@ -78,6 +80,11 @@ class _WarmupSparseAttentionFunction(torch.autograd.Function):
 
         ctx.save_for_backward(q_proxy, k_proxy, q, k, v, lse_main, o_main, document_ids)
         ctx.scale = float(scale)
+        ctx.kl_metric = kl_metric
+        ctx.record_kl_metric = bool(record_kl_metric)
+        if ctx.record_kl_metric:
+            kl_metric.zero_()
+        ctx.set_materialize_grads(False)
         return out, kl_loss
 
     @staticmethod
@@ -97,9 +104,11 @@ class _WarmupSparseAttentionFunction(torch.autograd.Function):
             grad_out,
             grad_kl,
             document_ids,
+            ctx.kl_metric,
             scale=ctx.scale,
+            record_kl_metric=ctx.record_kl_metric,
         )
-        return dq_proxy, dk_proxy, dq, dk, dv, None, None, None
+        return dq_proxy, dk_proxy, dq, dk, dv, None, None, None, None, None
 
 
 def sparse_attention_warmup(
@@ -113,6 +122,7 @@ def sparse_attention_warmup(
     document_list: torch.Tensor | None = None,
     *,
     cu_seqlens: torch.Tensor | None = None,
+    kl_metric: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute dense causal warmup attention and proxy-KL gradients."""
 
@@ -126,6 +136,20 @@ def sparse_attention_warmup(
         )
     if document_list is None:
         document_list = torch.empty(0, device=q.device, dtype=torch.int32)
+    record_kl_metric = kl_metric is not None
+    if kl_metric is None:
+        kl_metric = torch.empty((), device=q.device, dtype=torch.float32)
+    else:
+        assert kl_metric.shape == () and kl_metric.dtype == torch.float32
     return _WarmupSparseAttentionFunction.apply(
-        q_proxy, k_proxy, q, k, v, int(top_k), float(scale), document_list
+        q_proxy,
+        k_proxy,
+        q,
+        k,
+        v,
+        int(top_k),
+        float(scale),
+        document_list,
+        kl_metric,
+        record_kl_metric,
     )
