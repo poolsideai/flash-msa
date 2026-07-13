@@ -93,11 +93,19 @@ def _run_fused_selected_edge_backward(
     bsz, n_heads, seq_len, _ = q.shape
     n_proxy_heads = q_proxy.shape[1]
 
-    lse_proxy = compute_proxy_lse(
-        q_proxy,
-        k_proxy,
-        scale=float(scale),
-        metadata=metadata,
+    lse_proxy = (
+        compute_proxy_lse(
+            q_proxy,
+            k_proxy,
+            scale=float(scale),
+            metadata=metadata,
+        )
+        if grad_kl is not None
+        else torch.empty(
+            (bsz, n_proxy_heads, seq_len),
+            device=q.device,
+            dtype=torch.float32,
+        )
     )
 
     delta_main = (o_main.float() * grad_o_main.float()).sum(dim=-1)
@@ -203,6 +211,7 @@ class _SparseAttentionFunction(torch.autograd.Function):
             metadata.seq_len,
             metadata.top_k_blocks,
         )
+        ctx.set_materialize_grads(False)
         return out, kl_loss
 
     @staticmethod

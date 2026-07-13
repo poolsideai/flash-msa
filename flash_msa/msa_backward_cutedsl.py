@@ -44,10 +44,10 @@ def _derive_head_tiling(
         )
 
     main_per_proxy = int(n_heads) // int(n_proxy_heads)
-    rows_per_task = 64
+    rows_per_task = 128 if main_per_proxy == 1 else 192
     if main_per_proxy <= 0 or main_per_proxy > rows_per_task:
         raise NotImplementedError(
-            "main heads per proxy must fit the 64-row backward tile, "
+            "main heads per proxy must fit the backward tile, "
             f"got {main_per_proxy}"
         )
 
@@ -248,7 +248,7 @@ class _MSAFusedBackwardMMAKernel:
             ]
 
         mma_warps = self.num_threads // 32
-        mma_m_warps = min(mma_warps, max(1, self.rows_per_task // 16))
+        mma_m_warps = 8 if self.rows_per_task == 128 else 4
         mma_n_warps = max(1, mma_warps // mma_m_warps)
         tiled_mma_sdp = cute.make_tiled_mma(
             warp.MmaF16BF16Op(self._dtype, cutlass.Float32, (16, 8, 16)),

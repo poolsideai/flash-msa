@@ -143,7 +143,9 @@ __global__ void count_remote_slots_kernel(
         int p = (int)(tmp % Hp);
         int b = (int)(tmp / Hp);
         int key_block = block_indices[((int64_t)(b * Hp + p) * S + q) * Kb + slot];
-        key_block = max(0, min(NB - 1, key_block));
+        if ((unsigned)key_block >= (unsigned)NB || key_block >= q / 128) {
+            continue;
+        }
         int bucket = (b * Hp + p) * NB + key_block;
         atomicAdd(counts + bucket, 1);
     }
@@ -189,13 +191,14 @@ __global__ void scatter_remote_slots_kernel(
         int p = (int)(tmp % Hp);
         int b = (int)(tmp / Hp);
         int key_block = block_indices[((int64_t)(b * Hp + p) * S + q) * Kb + slot];
-        bool is_valid = (unsigned)key_block < (unsigned)NB && key_block < q / 128;
-        key_block = max(0, min(NB - 1, key_block));
+        if ((unsigned)key_block >= (unsigned)NB || key_block >= q / 128) {
+            continue;
+        }
 
         int bucket = (b * Hp + p) * NB + key_block;
         int pos = bucket_offsets[bucket] + atomicAdd(write_counts + bucket, 1);
         destinations[pos] = (int64_t)(b * Hp + p) * S + q;
-        valid[pos] = is_valid;
+        valid[pos] = true;
     }
 }
 

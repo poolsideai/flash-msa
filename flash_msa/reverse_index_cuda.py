@@ -285,6 +285,18 @@ def build_sparse_attention_metadata_cuda(
             remote_valid,
             int(BLOCK_SIZE),
         )
+        # FA4 reads only the compact prefix in remote_cu_seqlens. Spread the
+        # fixed trailing buffer so zero-weight merge atomics do not contend.
+        tail_destinations = torch.arange(
+            num_remote_edges,
+            device=block_indices_c.device,
+            dtype=torch.int64,
+        ).remainder(batch * n_proxy_heads * seq_len)
+        remote_destinations = torch.where(
+            remote_valid != 0,
+            remote_destinations,
+            tail_destinations,
+        )
     if document_ids_c.numel():
         document_ids_by_proxy = (
             document_ids_c[:, None, :].expand(batch, n_proxy_heads, seq_len).reshape(-1)
