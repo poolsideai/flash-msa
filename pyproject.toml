@@ -28,7 +28,7 @@ dependencies = [
   "cuda-python",
   "nvidia-cutlass-dsl[cu13]",
   "packaging",
-  "torch==2.12.0",
+  "torch>=2.11",
   "ninja",
 ]
 
