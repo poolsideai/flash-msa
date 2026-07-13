@@ -173,6 +173,7 @@ __global__ void scatter_remote_slots_kernel(
     int const* __restrict__ bucket_offsets,
     int* __restrict__ write_counts,
     int64_t* __restrict__ destinations,
+    int* __restrict__ positions,
     uint8_t* __restrict__ valid,
     int B,
     int Hp,
@@ -198,6 +199,7 @@ __global__ void scatter_remote_slots_kernel(
         int bucket = (b * Hp + p) * NB + key_block;
         int pos = bucket_offsets[bucket] + atomicAdd(write_counts + bucket, 1);
         destinations[pos] = (int64_t)(b * Hp + p) * S + q;
+        positions[e] = pos;
         valid[pos] = true;
     }
 }
@@ -340,6 +342,7 @@ void run_build_remote_layout(
     torch::Tensor write_counts,
     torch::Tensor bucket_offsets,
     torch::Tensor destinations,
+    torch::Tensor positions,
     torch::Tensor valid,
     int64_t block_size)
 {
@@ -349,6 +352,7 @@ void run_build_remote_layout(
     CHECK_INPUT(bucket_offsets);
     CHECK_CUDA(destinations);
     CHECK_CONTIGUOUS(destinations);
+    CHECK_INPUT(positions);
     CHECK_CUDA(valid);
     CHECK_CONTIGUOUS(valid);
 
@@ -369,12 +373,13 @@ void run_build_remote_layout(
     TORCH_CHECK(Kb > 1, "remote layout requires at least two selected blocks");
     TORCH_CHECK(counts.numel() == buckets && write_counts.numel() == buckets, "remote counts have wrong size");
     TORCH_CHECK(bucket_offsets.numel() == buckets + 1, "bucket_offsets has wrong size");
-    TORCH_CHECK(destinations.numel() == remote_edges && valid.numel() == remote_edges, "remote edge buffers have wrong size");
+    TORCH_CHECK(destinations.numel() == remote_edges && positions.numel() == remote_edges && valid.numel() == remote_edges, "remote edge buffers have wrong size");
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     C10_CUDA_CHECK(cudaMemsetAsync(counts.data_ptr<int>(), 0, counts.numel() * sizeof(int), stream));
     C10_CUDA_CHECK(cudaMemsetAsync(write_counts.data_ptr<int>(), 0, write_counts.numel() * sizeof(int), stream));
     C10_CUDA_CHECK(cudaMemsetAsync(destinations.data_ptr<int64_t>(), 0, destinations.numel() * sizeof(int64_t), stream));
+    C10_CUDA_CHECK(cudaMemsetAsync(positions.data_ptr<int>(), 0xff, positions.numel() * sizeof(int), stream));
     C10_CUDA_CHECK(cudaMemsetAsync(valid.data_ptr<uint8_t>(), 0, valid.numel() * sizeof(uint8_t), stream));
 
     int blocks = (int)std::min<int64_t>((remote_edges + kThreads - 1) / kThreads, 65535);
@@ -389,7 +394,7 @@ void run_build_remote_layout(
 
     scatter_remote_slots_kernel<<<blocks, kThreads, 0, stream>>>(
         block_indices.data_ptr<int>(), bucket_offsets.data_ptr<int>(), write_counts.data_ptr<int>(),
-        destinations.data_ptr<int64_t>(), valid.data_ptr<uint8_t>(),
+        destinations.data_ptr<int64_t>(), positions.data_ptr<int>(), valid.data_ptr<uint8_t>(),
         B, Hp, S, Kb, NB);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

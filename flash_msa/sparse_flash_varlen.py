@@ -120,28 +120,52 @@ def _local_block_attention(
 
 
 @torch.compile(fullgraph=True, dynamic=False)
-def _merge_remote_output(
+def _merge_remote_attention(
     local_output: torch.Tensor,
-    local_weight: torch.Tensor,
+    local_lse: torch.Tensor,
     remote_output: torch.Tensor,
-    remote_weight: torch.Tensor,
-    valid: torch.Tensor,
-    destination: torch.Tensor,
-    denominator: torch.Tensor,
-) -> torch.Tensor:
-    remote_weighted = torch.where(
-        valid[:, None, None],
-        remote_output.float() * remote_weight[..., None],
-        0.0,
+    remote_lse: torch.Tensor,
+    remote_positions: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    valid = remote_positions >= 0
+    positions = remote_positions.clamp_min(0)
+    gathered_lse = remote_lse[positions].masked_fill(
+        ~valid[..., None],
+        float("-inf"),
     )
-    destination_output = destination[:, None, None].expand_as(remote_weighted)
+    max_lse = torch.maximum(local_lse, gathered_lse.amax(dim=1))
+    local_weight = (local_lse - max_lse).exp()
+    remote_weight = (gathered_lse - max_lse[:, None]).exp()
+    denominator = local_weight + remote_weight.sum(dim=1)
+    output = (
+        local_output * local_weight[..., None]
+        + (
+            remote_output[positions].float()
+            * remote_weight[..., None]
+            * valid[..., None, None]
+        ).sum(dim=1)
+    ) / denominator[..., None]
+    return output, max_lse + denominator.log()
+
+
+@torch.compile(fullgraph=True, dynamic=False)
+def _merge_remote_lse(
+    local_lse: torch.Tensor,
+    remote_lse: torch.Tensor,
+    remote_positions: torch.Tensor,
+) -> torch.Tensor:
+    valid = remote_positions >= 0
+    gathered_lse = remote_lse[remote_positions.clamp_min(0)].masked_fill(
+        ~valid[..., None],
+        float("-inf"),
+    )
+    max_lse = torch.maximum(local_lse, gathered_lse.amax(dim=1))
     return (
-        (local_output * local_weight[..., None]).scatter_add(
-            0,
-            destination_output,
-            remote_weighted,
-        )
-        / denominator[..., None]
+        max_lse
+        + (
+            (local_lse - max_lse).exp()
+            + (gathered_lse - max_lse[:, None]).exp().sum(dim=1)
+        ).log()
     )
 
 
@@ -222,7 +246,6 @@ def sparse_flash_varlen_forward(
         output = local_output
     else:
         destination = metadata.remote_destinations
-        valid = metadata.remote_valid != 0
         cu_seqlens_q = metadata.remote_cu_seqlens
         q_grouped = (
             q.reshape(batch, n_proxy_heads, main_per_proxy, seq_len, head_dim)
@@ -300,31 +323,21 @@ def sparse_flash_varlen_forward(
             )
         remote_output, remote_lse_hs = paged_result
         remote_lse = remote_lse_hs.transpose(0, 1).contiguous()
-        remote_lse = remote_lse.masked_fill(~valid[:, None], float("-inf"))
-        destination_lse = destination[:, None].expand_as(remote_lse)
-        max_lse = local_lse.scatter_reduce(
-            0,
-            destination_lse,
-            remote_lse,
-            reduce="amax",
-            include_self=True,
+        remote_positions = metadata.remote_positions.view(
+            batch * n_proxy_heads * seq_len,
+            metadata.top_k_blocks - 1,
         )
-        local_weight = (local_lse - max_lse).exp()
-        remote_weight = (remote_lse - max_lse[destination]).exp()
-        denominator = local_weight.scatter_add(0, destination_lse, remote_weight)
-        lse = max_lse + denominator.log()
 
         if local_output is None:
             output = None
+            lse = _merge_remote_lse(local_lse, remote_lse, remote_positions)
         else:
-            output = _merge_remote_output(
+            output, lse = _merge_remote_attention(
                 local_output,
-                local_weight,
+                local_lse,
                 remote_output,
-                remote_weight,
-                valid,
-                destination,
-                denominator,
+                remote_lse,
+                remote_positions,
             )
 
     lse = (

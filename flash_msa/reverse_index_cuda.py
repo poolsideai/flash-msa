@@ -130,7 +130,7 @@ class SparseAttentionMetadata:
     task_meta: torch.Tensor
     task_qids: torch.Tensor
     remote_destinations: torch.Tensor
-    remote_valid: torch.Tensor
+    remote_positions: torch.Tensor
     remote_cu_seqlens: torch.Tensor
     document_ids: torch.Tensor
     remote_q_document_ids: torch.Tensor
@@ -322,6 +322,9 @@ def build_sparse_attention_metadata_cuda(
     remote_destinations = torch.empty(
         num_remote_edges, device=block_indices_c.device, dtype=torch.int64
     )
+    remote_positions = torch.empty(
+        num_remote_edges, device=block_indices_c.device, dtype=torch.int32
+    )
     remote_valid = torch.empty(
         num_remote_edges, device=block_indices_c.device, dtype=torch.uint8
     )
@@ -332,6 +335,7 @@ def build_sparse_attention_metadata_cuda(
             remote_write_counts,
             remote_cu_seqlens,
             remote_destinations,
+            remote_positions,
             remote_valid,
             int(BLOCK_SIZE),
         )
@@ -361,7 +365,7 @@ def build_sparse_attention_metadata_cuda(
         task_meta=task_meta,
         task_qids=task_qids,
         remote_destinations=remote_destinations,
-        remote_valid=remote_valid,
+        remote_positions=remote_positions,
         remote_cu_seqlens=remote_cu_seqlens,
         document_ids=document_ids_c,
         remote_q_document_ids=remote_q_document_ids,

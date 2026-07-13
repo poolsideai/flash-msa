@@ -236,6 +236,14 @@ class _MSAFusedBackwardMMAKernel:
         sPdSpx_layout = cute.tile_to_shape(
             s_layout_atom, (self.proxy_query_rows, KEY_SLICE_SIZE), (0, 1)
         )
+        main_q_storage = cute.cosize(sQ_layout) if self.compute_main_gradients else 1
+        main_kv_storage = cute.cosize(sKV_layout) if self.compute_main_gradients else 1
+        proxy_q_storage = (
+            cute.cosize(sQpx_layout) if self.compute_proxy_gradients else 1
+        )
+        proxy_kv_storage = (
+            cute.cosize(sKV_layout) if self.compute_proxy_gradients else 1
+        )
 
         @cute.struct
         class SharedStorage:
@@ -243,13 +251,13 @@ class _MSAFusedBackwardMMAKernel:
                 cute.struct.MemRange[self._dtype, cute.cosize(sQ_layout)], 1024
             ]
             sdO: cute.struct.Align[
-                cute.struct.MemRange[self._dtype, cute.cosize(sQ_layout)], 1024
+                cute.struct.MemRange[self._dtype, main_q_storage], 1024
             ]
             sK: cute.struct.Align[
                 cute.struct.MemRange[self._dtype, cute.cosize(sKV_layout)], 1024
             ]
             sV: cute.struct.Align[
-                cute.struct.MemRange[self._dtype, cute.cosize(sKV_layout)], 1024
+                cute.struct.MemRange[self._dtype, main_kv_storage], 1024
             ]
             sP: cute.struct.Align[
                 cute.struct.MemRange[self._dtype, cute.cosize(sPdS_layout)], 1024
@@ -258,10 +266,10 @@ class _MSAFusedBackwardMMAKernel:
                 cute.struct.MemRange[self._dtype, cute.cosize(sPdS_layout)], 1024
             ]
             sQpx: cute.struct.Align[
-                cute.struct.MemRange[self._dtype, cute.cosize(sQpx_layout)], 1024
+                cute.struct.MemRange[self._dtype, proxy_q_storage], 1024
             ]
             sKpx: cute.struct.Align[
-                cute.struct.MemRange[self._dtype, cute.cosize(sKV_layout)], 1024
+                cute.struct.MemRange[self._dtype, proxy_kv_storage], 1024
             ]
 
         mma_warps = self.num_threads // 32
