@@ -108,7 +108,6 @@ class ReverseIndexWorkspace:
                     device=device,
                     dtype=torch.int32,
                 ),
-                "num_tasks": torch.empty(1, device=device, dtype=torch.int32),
             }
         return self.cache[key]
 
@@ -179,12 +178,10 @@ def build_reverse_index_cuda(
         ws["bucket_offsets"],
         ws["task_meta"],
         ws["task_qids"],
-        ws["num_tasks"],
         int(BLOCK_SIZE),
         int(query_chunk),
     )
-    num_tasks = int(ws["num_tasks"].cpu()[0])
-    return ws["task_meta"][:num_tasks], ws["task_qids"][:num_tasks]
+    return ws["task_meta"], ws["task_qids"]
 
 
 def build_sparse_attention_metadata_cuda(
@@ -233,8 +230,6 @@ def build_sparse_attention_metadata_cuda(
     packed_qids = torch.empty(max_edges, device=device, dtype=torch.int32)
     destinations = torch.empty(max_edges, device=device, dtype=torch.int32)
     edge_positions = torch.empty(max_edges, device=device, dtype=torch.int32)
-    sizes = torch.empty(2, device=device, dtype=torch.int32)
-
     _load_ext().run_build_remote_metadata(
         block_indices_c,
         remote_counts,
@@ -245,13 +240,11 @@ def build_sparse_attention_metadata_cuda(
         packed_qids,
         destinations,
         edge_positions,
-        sizes,
         int(BLOCK_SIZE),
         int(remote_query_chunk),
     )
-    sizes_cpu = sizes.cpu()
-    num_remote_tasks = int(sizes_cpu[0])
-    remote_task_meta_cpu = remote_task_meta[:num_remote_tasks].cpu()
+    remote_task_meta_cpu = remote_task_meta.cpu()
+    num_remote_tasks = int(remote_task_meta_cpu[:, 3].count_nonzero())
     return SparseAttentionMetadata(
         task_meta=task_meta,
         task_qids=task_qids,

@@ -50,7 +50,6 @@ __global__ void scan_fill_meta_kernel(
     int const* __restrict__ counts,
     int* __restrict__ bucket_offsets,
     int* __restrict__ task_meta,
-    int* __restrict__ num_tasks,
     int B,
     int Hp,
     int NB,
@@ -83,7 +82,6 @@ __global__ void scan_fill_meta_kernel(
             ++task;
         }
     }
-    num_tasks[0] = task;
 }
 
 __global__ void scatter_edges_kernel(
@@ -156,7 +154,6 @@ __global__ void scan_remote_meta_kernel(
     int* __restrict__ bucket_offsets,
     int* __restrict__ task_meta,
     int* __restrict__ task_offsets,
-    int* __restrict__ sizes,
     int B,
     int Hp,
     int NB,
@@ -192,8 +189,6 @@ __global__ void scan_remote_meta_kernel(
     }
     bucket_offsets[buckets] = edge;
     task_offsets[task] = edge;
-    sizes[0] = task;
-    sizes[1] = edge;
 }
 
 __global__ void scatter_remote_edges_kernel(
@@ -362,7 +357,6 @@ void run_build_reverse_index(
     torch::Tensor bucket_offsets,
     torch::Tensor task_meta,
     torch::Tensor task_qids,
-    torch::Tensor num_tasks,
     int64_t block_size,
     int64_t query_chunk)
 {
@@ -372,12 +366,10 @@ void run_build_reverse_index(
     CHECK_INPUT(bucket_offsets);
     CHECK_INPUT(task_meta);
     CHECK_INPUT(task_qids);
-    CHECK_INPUT(num_tasks);
 
     TORCH_CHECK(block_indices.dim() == 4, "block_indices must have shape [B, Hp, S, Kb]");
     TORCH_CHECK(task_meta.dim() == 2 && task_meta.size(1) == 4, "task_meta must have shape [T, 4]");
     TORCH_CHECK(task_qids.dim() == 2 && task_qids.size(1) == query_chunk, "task_qids must have shape [T, query_chunk]");
-    TORCH_CHECK(num_tasks.numel() == 1, "num_tasks must be a scalar tensor");
     TORCH_CHECK(block_size == 128, "backward metadata currently requires block_size=128");
     TORCH_CHECK(query_chunk > 0, "query_chunk must be positive");
 
@@ -401,7 +393,6 @@ void run_build_reverse_index(
     C10_CUDA_CHECK(cudaMemsetAsync(write_counts.data_ptr<int>(), 0, write_counts.numel() * sizeof(int), stream));
     C10_CUDA_CHECK(cudaMemsetAsync(task_meta.data_ptr<int>(), 0, task_meta.numel() * sizeof(int), stream));
     C10_CUDA_CHECK(cudaMemsetAsync(task_qids.data_ptr<int>(), 0xff, task_qids.numel() * sizeof(int), stream));
-    C10_CUDA_CHECK(cudaMemsetAsync(num_tasks.data_ptr<int>(), 0, sizeof(int), stream));
 
     int64_t edges = (int64_t)B * Hp * S * Kb;
     int blocks = (int)std::min<int64_t>((edges + kThreads - 1) / kThreads, 65535);
@@ -421,7 +412,6 @@ void run_build_reverse_index(
         counts.data_ptr<int>(),
         bucket_offsets.data_ptr<int>(),
         task_meta.data_ptr<int>(),
-        num_tasks.data_ptr<int>(),
         B,
         Hp,
         NB,
@@ -454,7 +444,6 @@ void run_build_remote_metadata(
     torch::Tensor packed_qids,
     torch::Tensor destinations,
     torch::Tensor edge_positions,
-    torch::Tensor sizes,
     int64_t block_size,
     int64_t query_chunk)
 {
@@ -467,13 +456,11 @@ void run_build_remote_metadata(
     CHECK_INPUT(packed_qids);
     CHECK_INPUT(destinations);
     CHECK_INPUT(edge_positions);
-    CHECK_INPUT(sizes);
 
     TORCH_CHECK(block_size == 128, "remote metadata currently requires block_size=128");
     TORCH_CHECK(query_chunk > 0, "query_chunk must be positive");
     TORCH_CHECK(block_indices.dim() == 4, "block_indices must have shape [B, Hp, S, Kb]");
     TORCH_CHECK(task_meta.dim() == 2 && task_meta.size(1) == 5, "task_meta must have shape [T, 5]");
-    TORCH_CHECK(sizes.numel() == 2, "sizes must contain [num_tasks, num_edges]");
 
     int B = (int)block_indices.size(0);
     int Hp = (int)block_indices.size(1);
@@ -499,7 +486,6 @@ void run_build_remote_metadata(
     C10_CUDA_CHECK(cudaMemsetAsync(packed_qids.data_ptr<int>(), 0xff, packed_qids.numel() * sizeof(int), stream));
     C10_CUDA_CHECK(cudaMemsetAsync(destinations.data_ptr<int>(), 0xff, destinations.numel() * sizeof(int), stream));
     C10_CUDA_CHECK(cudaMemsetAsync(edge_positions.data_ptr<int>(), 0xff, edge_positions.numel() * sizeof(int), stream));
-    C10_CUDA_CHECK(cudaMemsetAsync(sizes.data_ptr<int>(), 0, sizes.numel() * sizeof(int), stream));
 
     int blocks = (int)std::min<int64_t>((max_edges + kThreads - 1) / kThreads, 65535);
     blocks = std::max(blocks, 1);
@@ -509,7 +495,7 @@ void run_build_remote_metadata(
 
     scan_remote_meta_kernel<<<1, 1, 0, stream>>>(
         counts.data_ptr<int>(), bucket_offsets.data_ptr<int>(), task_meta.data_ptr<int>(),
-        task_offsets.data_ptr<int>(), sizes.data_ptr<int>(), B, Hp, NB,
+        task_offsets.data_ptr<int>(), B, Hp, NB,
         (int)query_chunk, padded_tasks);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
