@@ -48,6 +48,7 @@ def test_packed_documents_isolate_outputs_and_gradients(kernel) -> None:
     documents[:, :190] = 0
     documents[:, 190:350] = 1
     documents[:, 350:] = 2
+    cu_seqlens = torch.tensor([0, 190, 350, 512], device="cuda", dtype=torch.int32)
     shapes = {
         "q_proxy": (batch, 1, seq_len, head_dim),
         "k_proxy": (batch, 1, seq_len, head_dim),
@@ -60,7 +61,7 @@ def test_packed_documents_isolate_outputs_and_gradients(kernel) -> None:
         for name, shape in shapes.items()
     }
 
-    def run(values):
+    def run(values, *, use_cu_seqlens: bool = False):
         tensors = {
             name: value.detach().clone().requires_grad_(True)
             for name, value in values.items()
@@ -73,7 +74,8 @@ def test_packed_documents_isolate_outputs_and_gradients(kernel) -> None:
             tensors["v"],
             256,
             head_dim**-0.5,
-            documents,
+            None if use_cu_seqlens else documents,
+            **({"cu_seqlens": cu_seqlens} if use_cu_seqlens else {}),
         )
         (out[:, 190:350].float().square().sum() + aux).backward()
         return out.detach(), tensors
@@ -84,7 +86,13 @@ def test_packed_documents_isolate_outputs_and_gradients(kernel) -> None:
         value[:, :, 350:] += torch.randn_like(value[:, :, 350:]) * 10
 
     output, tensors = run(inputs)
+    cu_output, cu_tensors = run(inputs, use_cu_seqlens=True)
     perturbed_output, perturbed_tensors = run(perturbed)
+    torch.testing.assert_close(cu_output, output)
+    for name in inputs:
+        assert tensors[name].grad is not None
+        assert cu_tensors[name].grad is not None
+        torch.testing.assert_close(cu_tensors[name].grad, tensors[name].grad)
     torch.testing.assert_close(output[:, 190:350], perturbed_output[:, 190:350])
     for name in ("q", "k", "v"):
         tensor = tensors[name]

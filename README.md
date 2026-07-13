@@ -36,6 +36,22 @@ uv pip install -e . --no-build-isolation
 from flash_msa import flash_msa_func
 attn_out, kl_loss = flash_msa_func(Q_proxy, K_proxy, Q, K, V, top_k, head_dim ** -0.5)
 ```
+For packed-document attention, pass FA4-style cumulative offsets over flattened
+``B * S`` tokens. The offsets must include every batch-row boundary.
+
+```
+attn_out, kl_loss = flash_msa_func(
+    Q_proxy,
+    K_proxy,
+    Q,
+    K,
+    V,
+    top_k,
+    head_dim ** -0.5,
+    cu_seqlens=cu_seqlens,
+)
+```
+
 or
 ```
 from flash_msa import flash_msa_warmup

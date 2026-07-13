@@ -49,11 +49,15 @@ def _derive_head_tiling(
         )
 
     main_per_proxy = int(n_heads) // int(n_proxy_heads)
-    rows_per_task = 128 if main_per_proxy == 1 else 192
+    if main_per_proxy == 1:
+        rows_per_task = 128
+    elif main_per_proxy == 4:
+        rows_per_task = 64
+    else:
+        rows_per_task = 192
     if main_per_proxy <= 0 or main_per_proxy > rows_per_task:
         raise NotImplementedError(
-            "main heads per proxy must fit the backward tile, "
-            f"got {main_per_proxy}"
+            f"main heads per proxy must fit the backward tile, got {main_per_proxy}"
         )
 
     query_chunk = rows_per_task // main_per_proxy

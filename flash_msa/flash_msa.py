@@ -11,6 +11,7 @@ from flash_msa.msa_forward_cutedsl import run_main_forward
 from flash_msa.reverse_index_cuda import (
     SparseAttentionMetadata,
     build_sparse_attention_metadata_cuda,
+    document_ids_from_cu_seqlens,
 )
 
 BLOCK_SIZE = 128
@@ -283,14 +284,26 @@ def sparse_attention(
     v: torch.Tensor,
     top_k: int,
     scale: float,
-    document_ids: torch.Tensor | None = None,
+    document_list: torch.Tensor | None = None,
+    *,
+    cu_seqlens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the attention output and the proxy-KL autograd placeholder.
+
+    ``cu_seqlens`` contains flattened document offsets and must include every
+    batch-row boundary. It is expanded entirely on CUDA so packed attention
+    does not add a device-to-host synchronization.
     """
-    Return (attn_out, kl_loss placeholder)
-    Saves reverse-index metadata and main attention state for backward.
-    """
-    if document_ids is None:
-        document_ids = torch.empty(0, device=q.device, dtype=torch.int32)
+    if document_list is not None and cu_seqlens is not None:
+        raise ValueError("document_list and cu_seqlens are mutually exclusive")
+    if cu_seqlens is not None:
+        document_list = document_ids_from_cu_seqlens(
+            cu_seqlens,
+            batch_size=q.shape[0],
+            seq_len=q.shape[2],
+        )
+    if document_list is None:
+        document_list = torch.empty(0, device=q.device, dtype=torch.int32)
     return _SparseAttentionFunction.apply(
         q_proxy,
         k_proxy,
@@ -299,5 +312,5 @@ def sparse_attention(
         v,
         int(top_k),
         float(scale),
-        document_ids,
+        document_list,
     )

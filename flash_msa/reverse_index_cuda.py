@@ -141,6 +141,36 @@ class SparseAttentionMetadata:
     top_k_blocks: int
 
 
+def document_ids_from_cu_seqlens(
+    cu_seqlens: torch.Tensor,
+    *,
+    batch_size: int,
+    seq_len: int,
+) -> torch.Tensor:
+    """Expand flattened document offsets to the device-side mask representation."""
+
+    if cu_seqlens.ndim != 1 or cu_seqlens.dtype != torch.int32:
+        raise ValueError("cu_seqlens must be a one-dimensional int32 tensor")
+    if cu_seqlens.device.type != "cuda":
+        raise ValueError("cu_seqlens must be a CUDA tensor")
+    if cu_seqlens.numel() < 2:
+        raise ValueError("cu_seqlens must contain at least two offsets")
+
+    total_tokens = batch_size * seq_len
+    document_starts = torch.zeros(
+        total_tokens + 1,
+        device=cu_seqlens.device,
+        dtype=torch.bool,
+    )
+    document_starts.scatter_(0, cu_seqlens.to(torch.int64), True)
+    return (
+        document_starts[:-1]
+        .cumsum(dim=0, dtype=torch.int32)
+        .sub_(1)
+        .reshape(batch_size, seq_len)
+    )
+
+
 def build_reverse_index_cuda(
     block_indices: torch.Tensor,
     *,
@@ -329,4 +359,5 @@ __all__ = [
     "build_dense_causal_schedule_cuda",
     "build_reverse_index_cuda",
     "build_sparse_attention_metadata_cuda",
+    "document_ids_from_cu_seqlens",
 ]

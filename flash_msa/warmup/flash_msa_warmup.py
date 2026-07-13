@@ -2,6 +2,8 @@
 
 import torch
 
+from flash_msa.reverse_index_cuda import document_ids_from_cu_seqlens
+
 
 def _validate_inputs(
     q_proxy: torch.Tensor,
@@ -108,12 +110,22 @@ def sparse_attention_warmup(
     v: torch.Tensor,
     top_k: int,
     scale: float,
-    document_ids: torch.Tensor | None = None,
+    document_list: torch.Tensor | None = None,
+    *,
+    cu_seqlens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute dense causal warmup attention and proxy KL gradients."""
+    """Compute dense causal warmup attention and proxy-KL gradients."""
 
-    if document_ids is None:
-        document_ids = torch.empty(0, device=q.device, dtype=torch.int32)
+    if document_list is not None and cu_seqlens is not None:
+        raise ValueError("document_list and cu_seqlens are mutually exclusive")
+    if cu_seqlens is not None:
+        document_list = document_ids_from_cu_seqlens(
+            cu_seqlens,
+            batch_size=q.shape[0],
+            seq_len=q.shape[2],
+        )
+    if document_list is None:
+        document_list = torch.empty(0, device=q.device, dtype=torch.int32)
     return _WarmupSparseAttentionFunction.apply(
-        q_proxy, k_proxy, q, k, v, int(top_k), float(scale), document_ids
+        q_proxy, k_proxy, q, k, v, int(top_k), float(scale), document_list
     )
