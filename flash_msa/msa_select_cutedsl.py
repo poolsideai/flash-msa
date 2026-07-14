@@ -16,12 +16,6 @@ from cutlass import Int32, cute
 from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.cute.runtime import from_dlpack
 
-from flash_msa._flash_attn_compat import (
-    flash_attn_block_sparse_forward,
-    flash_attn_lse_value_dim,
-)
-from flash_msa.reverse_index_cuda import SparseAttentionMetadata
-
 BLOCK_SIZE = 128
 SELECT_M = 128
 KEY_SLICE_SIZE = 64
@@ -43,7 +37,6 @@ class _MSASelectBlocksKernel:
         seq_len: int,
         top_k_blocks: int,
         head_dim: int,
-        has_document_mask: bool,
         num_threads: int = 128,
     ) -> None:
         if head_dim != 128:
@@ -61,7 +54,6 @@ class _MSASelectBlocksKernel:
         self.num_query_tiles = (int(seq_len) + SELECT_M - 1) // SELECT_M
         self.top_k_blocks = int(top_k_blocks)
         self.head_dim = int(head_dim)
-        self.has_document_mask = bool(has_document_mask)
         self.head_dim_padded = (int(head_dim) + 31) // 32 * 32
         self.rows_per_task = SELECT_M
         self.num_threads = int(num_threads)
@@ -302,13 +294,9 @@ class _MSASelectBlocksKernel:
                             + Int32(key_slice * KEY_SLICE_SIZE)
                             + col_n
                         )
-                        same_document = True
-                        if cutlass.const_expr(self.has_document_mask):
-                            if row_is_valid:
-                                same_document = (
-                                    document_ids[batch, q_pos]
-                                    == document_ids[batch, k_pos]
-                                )
+                        same_document = row_is_valid and (
+                            document_ids[batch, q_pos] == document_ids[batch, k_pos]
+                        )
                         if (not row_is_valid) or k_pos > q_pos or not same_document:
                             acc_S_mn[rr, cc] = -cutlass.Float32.inf
 
@@ -461,7 +449,6 @@ def _compile_select_kernel(
     seq_len: int,
     top_k_blocks: int,
     head_dim: int,
-    has_document_mask: bool,
     q_proxy: cute.Tensor,
     k_proxy: cute.Tensor,
     document_ids: cute.Tensor,
@@ -477,7 +464,6 @@ def _compile_select_kernel(
         int(seq_len),
         int(top_k_blocks),
         int(head_dim),
-        bool(has_document_mask),
         q_proxy.element_type,
         k_proxy.element_type,
         document_ids.element_type,
@@ -491,7 +477,6 @@ def _compile_select_kernel(
             seq_len=seq_len,
             top_k_blocks=top_k_blocks,
             head_dim=head_dim,
-            has_document_mask=has_document_mask,
         )
         _COMPILE_CACHE[key] = cute.compile(
             kernel,
@@ -535,7 +520,7 @@ def select_blocks(
     q_c = q_proxy.detach().contiguous()
     k_c = k_proxy.detach().contiguous()
     document_ids_c = document_ids.detach().to(torch.int32).contiguous()
-    if document_ids_c.numel() and document_ids_c.shape != (batch, seq_len):
+    if document_ids_c.shape != (batch, seq_len):
         raise ValueError("document_ids must have shape [B, S]")
     block_indices = torch.empty(
         (batch, n_proxy_heads, seq_len, int(top_k_blocks)),
@@ -556,7 +541,6 @@ def select_blocks(
         seq_len,
         int(top_k_blocks),
         head_dim,
-        bool(document_ids_c.numel()),
         q_t,
         k_t,
         document_ids_t,
@@ -573,49 +557,3 @@ def select_blocks(
         stream,
     )
     return block_indices
-
-
-def compute_proxy_lse(
-    q_proxy: torch.Tensor,
-    k_proxy: torch.Tensor,
-    *,
-    scale: float,
-    metadata: SparseAttentionMetadata,
-) -> torch.Tensor:
-    """Compute selected-token proxy LSE with varlen FlashAttention."""
-
-    if q_proxy.device.type != "cuda" or k_proxy.device.type != "cuda":
-        raise ValueError("varlen FlashAttention proxy LSE requires CUDA tensors")
-    if q_proxy.dtype not in (torch.float16, torch.bfloat16):
-        raise TypeError(
-            f"varlen FlashAttention proxy LSE supports fp16/bf16, got {q_proxy.dtype}"
-        )
-    if q_proxy.ndim != 4 or k_proxy.ndim != 4:
-        raise ValueError("q_proxy and k_proxy must have shape (B, H, S, D)")
-
-    batch, n_proxy_heads, seq_len, head_dim = q_proxy.shape
-    if q_proxy.shape[0] != k_proxy.shape[0] or q_proxy.shape[2:] != k_proxy.shape[2:]:
-        raise ValueError(
-            "q_proxy and k_proxy must agree on batch, sequence, and head_dim"
-        )
-    if (metadata.batch, metadata.n_proxy_heads, metadata.seq_len) != (
-        batch,
-        n_proxy_heads,
-        seq_len,
-    ):
-        raise ValueError("metadata has an incompatible shape")
-
-    k_tokens = k_proxy.detach().transpose(1, 2)
-    _unused_out, lse_proxy = flash_attn_block_sparse_forward(
-        q=q_proxy.detach().transpose(1, 2),
-        k=k_tokens,
-        v=k_tokens[..., : flash_attn_lse_value_dim(k_proxy.device)],
-        selection=metadata.selection,
-        use_main_schedule=False,
-        group_size=1,
-        query_block_size=metadata.query_block_size,
-        key_block_size=BLOCK_SIZE,
-        softmax_scale=float(scale),
-        document_ids=metadata.document_ids,
-    )
-    return lse_proxy

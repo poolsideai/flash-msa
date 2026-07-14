@@ -29,11 +29,10 @@ GiB = 1024**3
 
 
 def flash_attn_function() -> Callable:
-    """Import FlashAttention 3 or the FlashAttention 4 CuTe-DSL package."""
-    try:
-        from flash_attn_interface import flash_attn_func
-    except ImportError:
-        from flash_attn.cute.interface import flash_attn_func
+    """Import FlashAttention 4 for the dense control."""
+
+    from flash_attn.cute.interface import flash_attn_func
+
     return flash_attn_func
 
 
@@ -66,7 +65,9 @@ def parse_int_list(value: str) -> list[int]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--batch-sizes", type=parse_int_list, default=[1, 2, 4])
-    parser.add_argument("--sequence-lengths", type=parse_int_list, default=[1024, 2048, 4096])
+    parser.add_argument(
+        "--sequence-lengths", type=parse_int_list, default=[1024, 2048, 4096]
+    )
     parser.add_argument("--n-heads", type=int, default=16)
     parser.add_argument("--n-kv-heads", type=int, default=2)
     parser.add_argument("--n-proxy-heads", type=int, default=4)
@@ -78,17 +79,25 @@ def parse_args() -> argparse.Namespace:
         type=parse_int_list,
         help="Comma-separated top-k sweep; overrides --top-k when provided.",
     )
-    parser.add_argument("--warmup", type=int, default=2, help="Untimed forward/backward iterations.")
-    parser.add_argument("--repeats", type=int, default=5, help="Timed iterations per phase.")
+    parser.add_argument(
+        "--warmup", type=int, default=2, help="Untimed forward/backward iterations."
+    )
+    parser.add_argument(
+        "--repeats", type=int, default=5, help="Timed iterations per phase."
+    )
     parser.add_argument(
         "--skip-memory-probes",
         action="store_true",
         help="Skip peak-memory probes; peak-memory fields are left empty.",
     )
     parser.add_argument("--dtype", choices=("bfloat16", "float16"), default="bfloat16")
-    parser.add_argument("--kernels", choices=("both", "flash-msa", "flash-attn"), default="both")
+    parser.add_argument(
+        "--kernels", choices=("both", "flash-msa", "flash-attn"), default="both"
+    )
     parser.add_argument("--seed", type=int, default=67)
-    parser.add_argument("--csv", type=Path, help="Optionally write machine-readable results.")
+    parser.add_argument(
+        "--csv", type=Path, help="Optionally write machine-readable results."
+    )
     return parser.parse_args()
 
 
@@ -112,7 +121,9 @@ def validate(args: argparse.Namespace) -> None:
         if args.n_proxy_heads % args.n_proxy_kv_heads:
             raise ValueError("--n-proxy-heads must be divisible by --n-proxy-kv-heads")
         if args.n_proxy_heads < args.n_kv_heads or args.n_proxy_heads % args.n_kv_heads:
-            raise ValueError("Flash-MSA requires proxy heads >= and divisible by KV heads")
+            raise ValueError(
+                "Flash-MSA requires proxy heads >= and divisible by KV heads"
+            )
         if any(top_k % 128 for top_k in top_ks):
             raise ValueError("all top-k values must be divisible by 128")
         bad = [
@@ -128,10 +139,18 @@ def validate(args: argparse.Namespace) -> None:
             )
 
 
-def make_inputs(kernel: str, batch: int, sequence: int, args: argparse.Namespace, dtype: torch.dtype):
+def make_inputs(
+    kernel: str, batch: int, sequence: int, args: argparse.Namespace, dtype: torch.dtype
+):
     def rand(heads: int) -> torch.Tensor:
         return torch.randn(
-            batch, sequence, heads, args.head_dim, device="cuda", dtype=dtype, requires_grad=True
+            batch,
+            sequence,
+            heads,
+            args.head_dim,
+            device="cuda",
+            dtype=dtype,
+            requires_grad=True,
         )
 
     q, k, v = rand(args.n_heads), rand(args.n_kv_heads), rand(args.n_kv_heads)
@@ -139,7 +158,10 @@ def make_inputs(kernel: str, batch: int, sequence: int, args: argparse.Namespace
         return q, k, v
     # Flash-MSA consumes head-major tensors.
     qp, kp = rand(args.n_proxy_heads), rand(args.n_proxy_kv_heads)
-    return tuple(x.transpose(1, 2).contiguous().detach().requires_grad_(True) for x in (qp, kp, q, k, v))
+    return tuple(
+        x.transpose(1, 2).contiguous().detach().requires_grad_(True)
+        for x in (qp, kp, q, k, v)
+    )
 
 
 def output_loss(
@@ -150,13 +172,21 @@ def output_loss(
     fa_func: Callable,
 ):
     if kernel == "flash-msa":
-        output, kl_loss = flash_msa_func(*inputs, top_k, args.head_dim**-0.5)
+        batch, _, sequence, _ = inputs[0].shape
+        document_ids = torch.zeros(
+            (batch, sequence),
+            device=inputs[0].device,
+            dtype=torch.int32,
+        )
+        output, kl_loss = flash_msa_func(
+            *inputs,
+            top_k,
+            args.head_dim**-0.5,
+            document_ids,
+        )
         return output, output.float().sum() + kl_loss.float()
     output = fa_func(*inputs, softmax_scale=args.head_dim**-0.5, causal=True)
-    # FA4's CuTe interface returns ``(out, lse)`` even with return_lse=False;
-    # FA3 returns the output tensor directly by default.
-    if isinstance(output, tuple):
-        output = output[0]
+    output = output[0]
     return output, output.float().sum()
 
 
@@ -267,7 +297,10 @@ def print_results(results: list[Result]) -> None:
         )
         for r in results
     ]
-    widths = [max(len(header), *(len(row[i]) for row in rows)) for i, header in enumerate(headers)]
+    widths = [
+        max(len(header), *(len(row[i]) for row in rows))
+        for i, header in enumerate(headers)
+    ]
     print("  ".join(header.ljust(widths[i]) for i, header in enumerate(headers)))
     print("  ".join("-" * width for width in widths))
     for row in rows:
@@ -284,9 +317,13 @@ def main() -> None:
     fa_func = flash_attn_function() if args.kernels != "flash-msa" else None
     kernels = ["flash-msa", "flash-attn"] if args.kernels == "both" else [args.kernels]
     properties = torch.cuda.get_device_properties(torch.cuda.current_device())
-    print(f"GPU: {properties.name} ({properties.total_memory / GiB:.1f} GiB); dtype={args.dtype}")
-    print(f"Heads: Q={args.n_heads}, KV={args.n_kv_heads}, proxy-Q={args.n_proxy_heads}, "
-          f"proxy-KV={args.n_proxy_kv_heads}, D={args.head_dim}; top-k={top_ks}")
+    print(
+        f"GPU: {properties.name} ({properties.total_memory / GiB:.1f} GiB); dtype={args.dtype}"
+    )
+    print(
+        f"Heads: Q={args.n_heads}, KV={args.n_kv_heads}, proxy-Q={args.n_proxy_heads}, "
+        f"proxy-KV={args.n_proxy_kv_heads}, D={args.head_dim}; top-k={top_ks}"
+    )
 
     results: list[Result] = []
     for top_k in top_ks:

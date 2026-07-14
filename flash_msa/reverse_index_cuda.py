@@ -127,8 +127,8 @@ _DEFAULT_WORKSPACE = ReverseIndexWorkspace()
 class BlockSparseSelection(NamedTuple):
     """Exact token selections and reusable FA4 forward schedules."""
 
-    indices: torch.Tensor
     counts: torch.Tensor
+    membership_bits: torch.Tensor
     proxy_block_counts: torch.Tensor
     proxy_block_indices: torch.Tensor
     proxy_empty_block_counts: torch.Tensor
@@ -146,22 +146,19 @@ class SparseAttentionMetadata:
     task_qids: torch.Tensor
     document_ids: torch.Tensor
     query_block_size: int
+    top_k_blocks: int
 
     @property
     def batch(self) -> int:
-        return int(self.selection.indices.shape[0])
+        return int(self.selection.counts.shape[0])
 
     @property
     def n_proxy_heads(self) -> int:
-        return int(self.selection.indices.shape[1])
+        return int(self.selection.counts.shape[1])
 
     @property
     def seq_len(self) -> int:
-        return int(self.selection.indices.shape[2])
-
-    @property
-    def top_k_blocks(self) -> int:
-        return int(self.selection.indices.shape[3])
+        return int(self.selection.counts.shape[2])
 
     @property
     def selected_block_counts(self) -> torch.Tensor:
@@ -191,6 +188,25 @@ def build_block_sparse_selection(
     num_query_blocks = seq_len // query_block_size
     valid = block_indices < num_blocks
     counts = valid.sum(dim=-1, dtype=torch.int32).contiguous()
+    membership_words = (num_blocks + 31) // 32
+    membership_bits = torch.zeros(
+        (batch, n_proxy_heads, seq_len, membership_words),
+        dtype=torch.int32,
+        device=block_indices.device,
+    )
+    word_indices = block_indices.clamp_max(num_blocks - 1).div(
+        32,
+        rounding_mode="floor",
+    )
+    bits = torch.bitwise_left_shift(
+        torch.ones_like(block_indices),
+        block_indices.remainder(32),
+    )
+    membership_bits.scatter_add_(
+        3,
+        word_indices.to(torch.int64),
+        torch.where(valid, bits, 0),
+    )
 
     union_slots = torch.where(valid, block_indices, num_blocks).view(
         batch,
@@ -225,8 +241,8 @@ def build_block_sparse_selection(
     main_per_proxy = n_main_heads // n_proxy_heads
     main_counts = proxy_counts.repeat_interleave(main_per_proxy, dim=1).contiguous()
     return BlockSparseSelection(
-        indices=block_indices,
         counts=counts,
+        membership_bits=membership_bits,
         proxy_block_counts=proxy_counts,
         proxy_block_indices=proxy_indices,
         proxy_empty_block_counts=torch.zeros_like(proxy_counts),
@@ -291,7 +307,7 @@ def resolve_document_ids(
             seq_len=q.shape[seq_dim],
         )
     if document_list is None:
-        return torch.empty(0, device=q.device, dtype=torch.int32)
+        raise ValueError("Flash-MSA requires packed-document metadata")
     return document_list
 
 
@@ -399,7 +415,7 @@ def build_sparse_attention_metadata_cuda(
     batch, _n_proxy_heads, seq_len, _top_k_blocks = map(int, block_indices_c.shape)
     if seq_len % BLOCK_SIZE:
         raise ValueError(f"sequence length must be divisible by {BLOCK_SIZE}")
-    if document_ids.numel() and document_ids.shape != (batch, seq_len):
+    if document_ids.shape != (batch, seq_len):
         raise ValueError("document_ids must have shape [B, S]")
     document_ids_c = document_ids.detach().to(torch.int32).contiguous()
     major, minor = torch.cuda.get_device_capability(block_indices_c.device)
@@ -433,6 +449,7 @@ def build_sparse_attention_metadata_cuda(
         task_qids=task_qids,
         document_ids=document_ids_c,
         query_block_size=query_block_size,
+        top_k_blocks=int(block_indices_c.shape[3]),
     )
 
 

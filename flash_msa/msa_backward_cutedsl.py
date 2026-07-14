@@ -135,7 +135,6 @@ class _MSAFusedBackwardMMAKernel:
         head_dim: int,
         num_tasks: int,
         input_query_chunk: int,
-        has_document_mask: bool,
         record_kl_metric: bool,
         compute_main_gradients: bool,
         compute_proxy_gradients: bool,
@@ -156,7 +155,6 @@ class _MSAFusedBackwardMMAKernel:
         self.proxy_heads_per_kv = int(n_proxy_heads) // int(n_kv_heads)
         self.proxy_groups = int(n_proxy_heads) // int(n_proxy_kv_heads)
         self.input_query_chunk = int(input_query_chunk)
-        self.has_document_mask = bool(has_document_mask)
         self.record_kl_metric = bool(record_kl_metric)
         self.compute_main_gradients = bool(compute_main_gradients)
         self.compute_proxy_gradients = bool(compute_proxy_gradients)
@@ -600,13 +598,9 @@ class _MSAFusedBackwardMMAKernel:
                         + col_n
                     )
                     p = Float32(0.0)
-                    same_document = True
-                    if cutlass.const_expr(self.has_document_mask):
-                        if row_is_valid:
-                            same_document = (
-                                document_ids[batch, q_pos]
-                                == document_ids[batch, key_pos]
-                            )
+                    same_document = row_is_valid and (
+                        document_ids[batch, q_pos] == document_ids[batch, key_pos]
+                    )
                     if row_is_valid and key_pos <= q_pos and same_document:
                         p = cute.math.exp2(
                             acc_S_mn[rr, cc] * softmax_scale_log2 - lse * log2_e,
@@ -825,13 +819,9 @@ class _MSAFusedBackwardMMAKernel:
                         )
                         # HERE IS THE KL LOSS SURROGATE
                         ds_px = Float32(0.0)
-                        same_document = True
-                        if cutlass.const_expr(self.has_document_mask):
-                            if row_is_valid:
-                                same_document = (
-                                    document_ids[batch, q_pos]
-                                    == document_ids[batch, key_pos]
-                                )
+                        same_document = row_is_valid and (
+                            document_ids[batch, q_pos] == document_ids[batch, key_pos]
+                        )
                         if row_is_valid and key_pos <= q_pos and same_document:
                             p_px = cute.math.exp2(
                                 acc_Px_mn[rr, cc] * softmax_scale_log2
@@ -1065,7 +1055,6 @@ def _compile_fused_backward_kernel(
     head_dim: int,
     num_tasks: int,
     input_query_chunk: int,
-    has_document_mask: bool,
     record_kl_metric: bool,
     compute_main_gradients: bool,
     compute_proxy_gradients: bool,
@@ -1111,7 +1100,6 @@ def _compile_fused_backward_kernel(
         int(head_dim),
         int(num_tasks),
         int(input_query_chunk),
-        bool(has_document_mask),
         bool(record_kl_metric),
         bool(compute_main_gradients),
         bool(compute_proxy_gradients),
@@ -1164,7 +1152,6 @@ def _compile_fused_backward_kernel(
             head_dim=head_dim,
             num_tasks=num_tasks,
             input_query_chunk=input_query_chunk,
-            has_document_mask=has_document_mask,
             record_kl_metric=record_kl_metric,
             compute_main_gradients=compute_main_gradients,
             compute_proxy_gradients=compute_proxy_gradients,
@@ -1314,7 +1301,6 @@ def _run_fused_backward_impl(
         head_dim,
         num_tasks,
         input_query_chunk,
-        bool(document_ids_c.numel()),
         record_kl_metric,
         compute_main_gradients,
         compute_proxy_gradients,
@@ -1375,49 +1361,6 @@ def _run_fused_backward_impl(
         dq.to(dtype=q.dtype),
         dk.to(dtype=k.dtype),
         dv.to(dtype=v.dtype),
-    )
-
-
-def run_fused_backward(
-    q_proxy: torch.Tensor,
-    k_proxy: torch.Tensor,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    grad_o_main: torch.Tensor,
-    lse_main: torch.Tensor,
-    lse_proxy: torch.Tensor,
-    delta_main: torch.Tensor,
-    task_meta: torch.Tensor,
-    task_qids: torch.Tensor,
-    document_ids: torch.Tensor,
-    kl_metric: torch.Tensor,
-    *,
-    scale: float,
-    grad_kl_scale: float,
-    kl_metric_scale: float,
-    record_kl_metric: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-
-    return _run_fused_backward_impl(
-        q_proxy,
-        k_proxy,
-        q,
-        k,
-        v,
-        grad_o_main,
-        lse_main,
-        lse_proxy,
-        delta_main,
-        task_meta,
-        task_qids,
-        document_ids,
-        kl_metric,
-        scale=scale,
-        grad_kl_scale=grad_kl_scale,
-        kl_metric_scale=kl_metric_scale,
-        record_kl_metric=record_kl_metric,
-        compute_main_gradients=True,
     )
 
 

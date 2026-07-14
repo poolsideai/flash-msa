@@ -7,7 +7,14 @@ from flash_msa import flash_msa_warmup_func
 
 class WarmupModel(nn.Module):
     def __init__(
-        self, n_heads, n_kv_heads, head_dim, n_proxy_heads, n_proxy_kv_heads, top_k, use_kernel
+        self,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        n_proxy_heads,
+        n_proxy_kv_heads,
+        top_k,
+        use_kernel,
     ):
         super().__init__()
         assert n_heads % n_kv_heads == 0
@@ -36,7 +43,7 @@ class WarmupModel(nn.Module):
         self.top_k = top_k
         self.block_size = 128
         self.use_kernel = use_kernel
-        self.kl_criterion = nn.KLDivLoss(reduction='batchmean')
+        self.kl_criterion = nn.KLDivLoss(reduction="batchmean")
 
     def apply_rope(self, x):
         # x shape: (B, S, H, D)
@@ -62,7 +69,7 @@ class WarmupModel(nn.Module):
 
     def _attention_eager(self, q_proxy, k_proxy, q, k, v):
         b, hp, s, _ = q_proxy.shape
-        scaling = self.head_dim ** -0.5
+        scaling = self.head_dim**-0.5
 
         causal_mask = torch.triu(
             torch.ones(s, s, device=q_proxy.device, dtype=torch.bool),
@@ -92,21 +99,31 @@ class WarmupModel(nn.Module):
             s,
         ).mean(dim=2)
 
-        proxy_logprobs = F.log_softmax(proxy_scores, dim=-1).masked_fill(causal_mask, 0.0)
+        proxy_logprobs = F.log_softmax(proxy_scores, dim=-1).masked_fill(
+            causal_mask, 0.0
+        )
         main_attn_kl_target = main_attn_kl_target.masked_fill(causal_mask, 0.0)
 
-        kl_loss = F.kl_div(
-            input=proxy_logprobs,
-            target=main_attn_kl_target.detach(),
-            reduction="none",
-        ).sum(dim=-1).mean()
+        kl_loss = (
+            F.kl_div(
+                input=proxy_logprobs,
+                target=main_attn_kl_target.detach(),
+                reduction="none",
+            )
+            .sum(dim=-1)
+            .mean()
+        )
 
         return attn_out, kl_loss
 
     def forward(self, hidden_states):
         b, s, _ = hidden_states.shape
-        q_proxy = self.q_proxy(hidden_states).view(b, s, self.n_proxy_heads, self.head_dim)
-        k_proxy = self.k_proxy(hidden_states).view(b, s, self.n_proxy_kv_heads, self.head_dim)
+        q_proxy = self.q_proxy(hidden_states).view(
+            b, s, self.n_proxy_heads, self.head_dim
+        )
+        k_proxy = self.k_proxy(hidden_states).view(
+            b, s, self.n_proxy_kv_heads, self.head_dim
+        )
         q_proxy, k_proxy = self.apply_rope(q_proxy), self.apply_rope(k_proxy)
         q_proxy = q_proxy.transpose(1, 2)
         k_proxy = k_proxy.transpose(1, 2)
@@ -122,8 +139,16 @@ class WarmupModel(nn.Module):
         # QKV, qk_proxy: (B, H, S, D)
         # indexer_weights: (B, H, S)
         if self.use_kernel:
+            document_ids = torch.zeros((b, s), device=q.device, dtype=torch.int32)
             attn_out, kl_loss = flash_msa_warmup_func(
-                q_proxy, k_proxy, q, k, v, self.top_k, self.head_dim ** -0.5
+                q_proxy,
+                k_proxy,
+                q,
+                k,
+                v,
+                self.top_k,
+                self.head_dim**-0.5,
+                document_ids,
             )
         else:
             attn_out, kl_loss = self._attention_eager(q_proxy, k_proxy, q, k, v)

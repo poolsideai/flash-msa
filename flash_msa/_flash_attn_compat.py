@@ -1,4 +1,4 @@
-"""Compatibility hooks for FlashAttention 3 and FlashAttention 4."""
+"""FlashAttention 4 adapters for document-packed MSA training."""
 
 from __future__ import annotations
 
@@ -36,23 +36,6 @@ def _fa4_varlen_func():
             return None
         raise
     return flash_attn_varlen_func
-
-
-@lru_cache(maxsize=1)
-def _fa3_varlen_func():
-    try:
-        from flash_attn_interface import flash_attn_varlen_func
-    except ModuleNotFoundError as exc:
-        if exc.name == "flash_attn_interface":
-            return None
-        raise
-    return flash_attn_varlen_func
-
-
-def flash_attn_supports_narrow_value_dim() -> bool:
-    """Whether the active backend accepts the 8-wide dummy V used for LSE-only calls."""
-
-    return _fa4_varlen_func() is not None
 
 
 def flash_attn_lse_value_dim(device: torch.device) -> int:
@@ -98,92 +81,60 @@ def flash_attn_causal_document_mask() -> Callable:
     return _mask
 
 
-_block_sparse_mask_cache: dict[tuple[int, int, int, bool], Callable] = {}
+_block_sparse_bitset_mask_cache: dict[tuple[int, int], Callable] = {}
 
 
-def _block_sparse_mask(
+def _block_sparse_bitset_mask(
     group_size: int,
     block_size: int,
-    top_k_blocks: int,
-    with_documents: bool,
 ) -> Callable:
-    """Build the exact token-level predicate for scheduled FA4 blocks."""
+    """Build an exact predicate backed by packed token-block membership bits."""
 
-    key = (group_size, block_size, top_k_blocks, with_documents)
-    if key not in _block_sparse_mask_cache:
+    key = (group_size, block_size)
+    if key not in _block_sparse_bitset_mask_cache:
         import cutlass
         import cutlass.cute as cute
         from flash_attn.cute import utils as cute_utils
         from flash_attn.cute.block_sparsity import fast_sampling
 
         def _member(batch, head, q_idx, kv_idx, aux_tensors):
-            selected, counts = aux_tensors[:2]
+            membership = aux_tensors[0]
             proxy_head = head[0] // group_size
             kv_block = kv_idx[0] // block_size
-            target = cute_utils.scalar_to_ssa(kv_block, cutlass.Int32)
-            count = cute_utils.scalar_to_ssa(
-                counts[batch[0], proxy_head, q_idx[0]],
+            word_idx = kv_block // 32
+            bit_idx = kv_block - word_idx * 32
+            word = cute_utils.scalar_to_ssa(
+                membership[batch[0], proxy_head, q_idx[0], word_idx],
+                cutlass.Uint32,
+            )
+            bit = cute_utils.shl_u32(
+                cutlass.Uint32(1),
+                cutlass.Uint32(bit_idx),
+            )
+            return cutlass.Boolean(cute_utils.ssa_to_scalar(word) & bit)
+
+        @fast_sampling
+        @cute.jit
+        def _mask(batch, head, q_idx, kv_idx, seqlen_info, aux_tensors):
+            offset = seqlen_info.seqlen_k - seqlen_info.seqlen_q
+            causal = kv_idx <= (q_idx + cute_utils.scalar_to_ssa(offset, cutlass.Int32))
+            document_ids = aux_tensors[1]
+            query_document = cute_utils.scalar_to_ssa(
+                document_ids[batch[0], q_idx[0]],
                 cutlass.Int32,
             )
-            picked = cute_utils.scalar_to_ssa(
-                selected[batch[0], proxy_head, q_idx[0], 0],
+            key_document = cute_utils.scalar_to_ssa(
+                document_ids[batch[0], kv_idx[0]],
                 cutlass.Int32,
             )
-            member = (cute_utils.scalar_to_ssa(0, cutlass.Int32) < count) & (
-                picked == target
+            return (
+                causal
+                & _member(batch, head, q_idx, kv_idx, aux_tensors)
+                & (query_document == key_document)
             )
-            for slot in range(1, top_k_blocks):
-                picked = cute_utils.scalar_to_ssa(
-                    selected[batch[0], proxy_head, q_idx[0], slot],
-                    cutlass.Int32,
-                )
-                valid = cute_utils.scalar_to_ssa(slot, cutlass.Int32) < count
-                member = member | (valid & (picked == target))
-            return member
 
-        if with_documents:
-
-            @fast_sampling
-            @cute.jit
-            def _mask(batch, head, q_idx, kv_idx, seqlen_info, aux_tensors):
-                offset = seqlen_info.seqlen_k - seqlen_info.seqlen_q
-                causal = kv_idx <= (
-                    q_idx + cute_utils.scalar_to_ssa(offset, cutlass.Int32)
-                )
-                document_ids = aux_tensors[2]
-                query_document = cute_utils.scalar_to_ssa(
-                    document_ids[batch[0], q_idx[0]],
-                    cutlass.Int32,
-                )
-                key_document = cute_utils.scalar_to_ssa(
-                    document_ids[batch[0], kv_idx[0]],
-                    cutlass.Int32,
-                )
-                return (
-                    causal
-                    & _member(batch, head, q_idx, kv_idx, aux_tensors)
-                    & (query_document == key_document)
-                )
-
-        else:
-
-            @fast_sampling
-            @cute.jit
-            def _mask(batch, head, q_idx, kv_idx, seqlen_info, aux_tensors):
-                offset = seqlen_info.seqlen_k - seqlen_info.seqlen_q
-                causal = kv_idx <= (
-                    q_idx + cute_utils.scalar_to_ssa(offset, cutlass.Int32)
-                )
-                return causal & _member(
-                    batch,
-                    head,
-                    q_idx,
-                    kv_idx,
-                    aux_tensors,
-                )
-
-        _block_sparse_mask_cache[key] = _mask
-    return _block_sparse_mask_cache[key]
+        _block_sparse_bitset_mask_cache[key] = _mask
+    return _block_sparse_bitset_mask_cache[key]
 
 
 def flash_attn_block_sparse_forward(
@@ -217,15 +168,11 @@ def flash_attn_block_sparse_forward(
         block_indices = selection.proxy_block_indices
         empty_block_counts = selection.proxy_empty_block_counts
 
-    selected_aux = selection.indices.to(torch.int32).contiguous()
-    selected_aux.__leading_dim__ = 3
-    count_aux = selection.counts.to(torch.int32).contiguous()
-    count_aux.__leading_dim__ = 2
-    aux_tensors = [selected_aux, count_aux]
-    if document_ids.numel():
-        document_aux = document_ids.to(torch.int32).contiguous()
-        document_aux.__leading_dim__ = 1
-        aux_tensors.append(document_aux)
+    membership_aux = selection.membership_bits
+    membership_aux.__leading_dim__ = 3
+    document_aux = document_ids.to(torch.int32).contiguous()
+    document_aux.__leading_dim__ = 1
+    aux_tensors = [membership_aux, document_aux]
 
     block_sparse_tensors = BlockSparseTensorsTorch(
         mask_block_cnt=block_counts,
@@ -241,11 +188,9 @@ def flash_attn_block_sparse_forward(
         softmax_scale=softmax_scale,
         causal=False,
         pack_gqa=False,
-        mask_mod=_block_sparse_mask(
+        mask_mod=_block_sparse_bitset_mask(
             group_size,
             key_block_size,
-            int(selection.indices.shape[-1]),
-            bool(document_ids.numel()),
         ),
         aux_tensors=aux_tensors,
         block_sparse_tensors=block_sparse_tensors,
@@ -268,31 +213,11 @@ def flash_attn_varlen_forward(
     mask_mod: Callable | None = None,
     aux_tensors: list[torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return ``(out, lse)`` for FlashAttention 3 or 4."""
-
-    flash_attn_varlen_func = _fa3_varlen_func()
-    if flash_attn_varlen_func is not None:
-        if mask_mod is not None:
-            raise NotImplementedError("document masking requires FlashAttention 4")
-        out, lse = flash_attn_varlen_func(
-            q,
-            k,
-            v,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            return_attn_probs=True,
-        )
-        return out, lse
+    """Return `(out, lse)` from FA4 varlen attention."""
 
     flash_attn_varlen_func = _fa4_varlen_func()
     if flash_attn_varlen_func is None:
-        raise ModuleNotFoundError(
-            "Flash-MSA requires FlashAttention 3 or 4 varlen support"
-        )
+        raise ModuleNotFoundError("Flash-MSA requires FlashAttention 4")
 
     out, lse = flash_attn_varlen_func(
         q,

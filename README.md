@@ -14,7 +14,7 @@ More information is included in the [blog post](https://nanduruganesh.github.io/
 
 # Installation
 
-The sparse training path requires FA4 block-sparse attention at commit `6a94f8b906cf5ab944385d64707f9387f3dd6be9`, which adds compact block-index tensors. Dense warmup also supports FA3. Install the pinned FA4 dependency with:
+Sparse training and dense warmup require FA4 at commit `6a94f8b906cf5ab944385d64707f9387f3dd6be9`. The sparse path uses its compact block-index tensors. Install the pinned dependency with:
 
 ```
 uv pip install 'flash-msa[fa4]'
@@ -40,10 +40,20 @@ uv pip install -e . --no-build-isolation
 # Usage
 ```
 from flash_msa import flash_msa_func
-attn_out, kl_loss = flash_msa_func(Q_proxy, K_proxy, Q, K, V, top_k, head_dim ** -0.5)
+attn_out, kl_loss = flash_msa_func(
+    Q_proxy,
+    K_proxy,
+    Q,
+    K,
+    V,
+    top_k,
+    head_dim ** -0.5,
+    document_ids,
+)
 ```
-For packed-document attention, pass FA4-style cumulative offsets over flattened
-``B * S`` tokens. The offsets must include every batch-row boundary.
+Packed-document metadata is required. Callers may instead pass FA4-style
+cumulative offsets over flattened `B * S` tokens. The offsets must include
+every batch-row boundary.
 
 ```
 attn_out, kl_loss = flash_msa_func(
@@ -54,6 +64,7 @@ attn_out, kl_loss = flash_msa_func(
     V,
     top_k,
     head_dim ** -0.5,
+    None,
     cu_seqlens=cu_seqlens,
 )
 ```
@@ -61,13 +72,24 @@ attn_out, kl_loss = flash_msa_func(
 or
 ```
 from flash_msa import flash_msa_warmup_func
-attn_out, kl_loss = flash_msa_warmup_func(Q_proxy, K_proxy, Q, K, V, top_k, head_dim ** -0.5)
+attn_out, kl_loss = flash_msa_warmup_func(
+    Q_proxy,
+    K_proxy,
+    Q,
+    K,
+    V,
+    top_k,
+    head_dim ** -0.5,
+    document_ids,
+)
 ```
 
-Note that kl_loss in the forward is just a torch.zeros placeholder, but after adding it to the main model loss, calling backward() will activate the on-the-fly gradient calcs equivalent to the actual proxy KL loss signal.
+`kl_loss` is a zero-valued gradient carrier. The proxy cotangents are computed
+immediately in forward; adding the carrier to the model loss applies them with
+the outer loss scale during backward.
 
 To log the actual KL without materializing attention probabilities, pass a scalar FP32
-CUDA buffer. The fused backward updates it with the unweighted KL value:
+CUDA buffer. The immediate Indexer VJP updates it with the unweighted KL value:
 
 ```
 kl_metric = torch.zeros((), device=Q.device, dtype=torch.float32)
@@ -79,6 +101,7 @@ attn_out, kl_loss = flash_msa_func(
     V,
     top_k,
     head_dim ** -0.5,
+    document_ids,
     kl_metric=kl_metric,
 )
 loss = model_loss + kl_weight * kl_loss
@@ -124,10 +147,11 @@ warmup provides the same split through `dense_main_attention` and
 # Caveats
 
 1. Flash-MSA only supports headdims 128, block size 128.
-2. Flash-MSA does not return a materialized KL tensor. It can optionally accumulate the scalar KL during backward.
-3. No support for quantized training (fp8, nvfp4, mxfp4).
-4. No support for attn temps / oai-style softmax bias.
-5. The proxy-head count must be at least and divisible by the Main KV-head count.
+2. Flash-MSA requires packed-document IDs or cumulative document offsets.
+3. Flash-MSA does not return a materialized KL tensor. It can optionally accumulate the scalar KL during the immediate Indexer VJP.
+4. No support for quantized training (fp8, nvfp4, mxfp4).
+5. No support for attn temps / oai-style softmax bias.
+6. Sparse training uses one proxy-Q head per Main KV head and one shared proxy-K head.
 
 These are not ridiculous to implement though so if there is demand or if someone makes a PR, I will update the repo to include these features.
 
@@ -141,7 +165,9 @@ Test warmup MSA correctness against an eager implementation of MSA: `python test
 
 An MSA training example is implemented in this [Megatron-LM fork](https://github.com/nanduruganesh/Megatron-LM). 
 
-Notably, you must add the kl_loss returned by MSA kernels to the model's main CE loss before backward to train the proxy attention. The kl_loss is a torch.zeros placeholder and calculated on-the-fly in the backward, so logging that placeholder will not reflect how proxy training is actually going. Pass kl_metric when the actual scalar KL is needed.
+Notably, you must add the `kl_loss` gradient carrier returned by MSA kernels to
+the model's main CE loss before backward to train the proxy attention. Its value
+is zero, so pass `kl_metric` when the actual scalar KL is needed.
 
 In general if you are going to train with this it is highly recommended to follow tips from [the paper](https://arxiv.org/abs/2606.13392), use MSA warmup before turning on MSA sparse training, and replicate any transformations to the main attention queries and keys (RoPE, QK norm, QK clip, etc) to the proxy queries and keys to improve proxy convergence.
 

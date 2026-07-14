@@ -29,26 +29,6 @@ def _lse_from_flash(
     raise RuntimeError(f"unexpected FlashAttention LSE shape: {tuple(lse.shape)}")
 
 
-def run_main_forward(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    *,
-    scale: float,
-    document_ids: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run dense causal main attention and return ``(O_main, LSE_main, kl_loss)``."""
-
-    o_main, lse_main, kl_loss = run_main_forward_token_major(
-        q.transpose(1, 2).contiguous(),
-        k.transpose(1, 2).contiguous(),
-        v.transpose(1, 2).contiguous(),
-        scale=scale,
-        document_ids=document_ids,
-    )
-    return o_main.transpose(1, 2).contiguous(), lse_main, kl_loss
-
-
 def run_main_forward_token_major(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -99,9 +79,9 @@ def run_main_forward_token_major(
         max_seqlen_q=int(seq_len),
         max_seqlen_k=int(seq_len),
         softmax_scale=float(scale),
-        causal=not document_ids.numel(),
-        mask_mod=(flash_attn_causal_document_mask() if document_ids.numel() else None),
-        aux_tensors=[document_ids.reshape(-1)] if document_ids.numel() else None,
+        causal=False,
+        mask_mod=flash_attn_causal_document_mask(),
+        aux_tensors=[document_ids.reshape(-1)],
     )
 
     o_main = out.view(batch, seq_len, n_heads, head_dim)

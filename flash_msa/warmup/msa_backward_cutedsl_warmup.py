@@ -89,7 +89,6 @@ def _run_proxy_lse_flash(
     from flash_msa._flash_attn_compat import (
         flash_attn_causal_document_mask,
         flash_attn_lse_value_dim,
-        flash_attn_supports_narrow_value_dim,
         flash_attn_varlen_forward,
     )
 
@@ -109,14 +108,11 @@ def _run_proxy_lse_flash(
         batch + 1, device=q_proxy.device, dtype=torch.int32
     ) * int(seq_len)
 
-    if flash_attn_supports_narrow_value_dim():
-        value = torch.zeros(
-            (*k_pack.shape[:-1], flash_attn_lse_value_dim(k_proxy.device)),
-            device=k_proxy.device,
-            dtype=k_proxy.dtype,
-        )
-    else:
-        value = k_pack
+    value = torch.zeros(
+        (*k_pack.shape[:-1], flash_attn_lse_value_dim(k_proxy.device)),
+        device=k_proxy.device,
+        dtype=k_proxy.dtype,
+    )
     _out, lse = flash_attn_varlen_forward(
         q=q_pack,
         k=k_pack,
@@ -126,98 +122,8 @@ def _run_proxy_lse_flash(
         max_seqlen_q=int(seq_len),
         max_seqlen_k=int(seq_len),
         softmax_scale=float(scale),
-        causal=not document_ids.numel(),
-        mask_mod=(flash_attn_causal_document_mask() if document_ids.numel() else None),
-        aux_tensors=[document_ids.reshape(-1)] if document_ids.numel() else None,
+        causal=False,
+        mask_mod=flash_attn_causal_document_mask(),
+        aux_tensors=[document_ids.reshape(-1)],
     )
     return _lse_from_flash(lse, batch=batch, n_heads=n_proxy_heads, seq_len=seq_len)
-
-
-def run_warmup_backward(
-    q_proxy: torch.Tensor,
-    k_proxy: torch.Tensor,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    lse_main: torch.Tensor,
-    o_main: torch.Tensor,
-    grad_out: torch.Tensor | None,
-    grad_kl: torch.Tensor | None,
-    document_ids: torch.Tensor,
-    kl_metric: torch.Tensor,
-    *,
-    scale: float,
-    record_kl_metric: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run tiled CuTeDSL backward over the full causal block schedule."""
-
-    batch, n_heads, seq_len, head_dim = q.shape
-    n_proxy_heads = q_proxy.shape[1]
-    n_kv_heads = k.shape[1]
-
-    if q.device.type != "cuda":
-        raise ValueError("warmup CuTeDSL backward requires CUDA tensors")
-    if q.dtype not in (torch.float16, torch.bfloat16):
-        raise TypeError(f"warmup CuTeDSL backward supports fp16/bf16, got {q.dtype}")
-    if head_dim != 128:
-        raise NotImplementedError("warmup CuTeDSL backward supports only D=128")
-
-    if grad_out is None:
-        grad_o_main = torch.zeros_like(o_main)
-    else:
-        grad_o_main = (
-            grad_out.reshape(batch, seq_len, n_heads, head_dim)
-            .transpose(1, 2)
-            .contiguous()
-        )
-
-    # Proxy KL gradients are linear in the upstream scalar.  Keep the kernel
-    # argument static, then apply the device-resident scalar to the proxy
-    # gradients below instead of synchronizing through ``grad_kl.item()``.
-    proxy_grad_scale = (
-        0.0 if grad_kl is None else 1.0 / float(batch * n_proxy_heads * seq_len)
-    )
-
-    from flash_msa.msa_backward_cutedsl import _derive_head_tiling, run_fused_backward
-
-    _main_per_proxy, query_chunk, _rows_per_task, _proxy_query_rows = (
-        _derive_head_tiling(n_heads, n_kv_heads, n_proxy_heads)
-    )
-    task_meta, task_qids = _dense_causal_schedule(
-        batch=batch,
-        n_proxy_heads=n_proxy_heads,
-        seq_len=seq_len,
-        query_chunk=2 * query_chunk,
-        device=q.device,
-    )
-    lse_proxy = _run_proxy_lse_flash(
-        q_proxy, k_proxy, scale=float(scale), document_ids=document_ids
-    )
-    delta_main = (o_main.float() * grad_o_main.float()).sum(dim=-1)
-
-    dq_proxy, dk_proxy, dq, dk, dv = run_fused_backward(
-        q_proxy,
-        k_proxy,
-        q,
-        k,
-        v,
-        grad_o_main,
-        lse_main,
-        lse_proxy,
-        delta_main,
-        task_meta,
-        task_qids,
-        document_ids,
-        kl_metric,
-        scale=float(scale),
-        grad_kl_scale=proxy_grad_scale,
-        kl_metric_scale=(
-            1.0 / float(batch * n_proxy_heads * seq_len) if record_kl_metric else 0.0
-        ),
-        record_kl_metric=record_kl_metric,
-    )
-    if grad_kl is not None:
-        proxy_multiplier = grad_kl.detach().to(device=q.device, dtype=dq_proxy.dtype)
-        dq_proxy = dq_proxy * proxy_multiplier
-        dk_proxy = dk_proxy * proxy_multiplier.to(dtype=dk_proxy.dtype)
-    return dq_proxy, dk_proxy, dq, dk, dv

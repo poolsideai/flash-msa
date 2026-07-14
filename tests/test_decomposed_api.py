@@ -140,8 +140,8 @@ def test_decomposed_main_and_indexer_gradients_match_combined(
         schedule_ptrs = tuple(
             tensor.data_ptr()
             for tensor in (
-                metadata.selection.indices,
                 metadata.selection.counts,
+                metadata.selection.membership_bits,
                 metadata.selection.proxy_block_counts,
                 metadata.selection.proxy_block_indices,
                 metadata.selection.main_block_counts,
@@ -167,8 +167,8 @@ def test_decomposed_main_and_indexer_gradients_match_combined(
         assert schedule_ptrs == tuple(
             tensor.data_ptr()
             for tensor in (
-                metadata.selection.indices,
                 metadata.selection.counts,
+                metadata.selection.membership_bits,
                 metadata.selection.proxy_block_counts,
                 metadata.selection.proxy_block_indices,
                 metadata.selection.main_block_counts,
@@ -180,8 +180,8 @@ def test_decomposed_main_and_indexer_gradients_match_combined(
             id(tensor) for tensor in candidate_out.grad_fn.saved_tensors
         }
         forward_only_metadata = (
-            metadata.selection.indices,
             metadata.selection.counts,
+            metadata.selection.membership_bits,
             metadata.selection.proxy_block_counts,
             metadata.selection.proxy_block_indices,
             metadata.selection.main_block_counts,

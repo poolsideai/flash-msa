@@ -4,21 +4,30 @@ import torch.nn.functional as F
 
 from flash_msa import flash_msa_func
 
+
 class Model(nn.Module):
-    def __init__(self, n_heads, n_kv_heads, head_dim, n_proxy_heads, n_proxy_kv_heads, top_k, use_kernel):
+    def __init__(
+        self,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        n_proxy_heads,
+        n_proxy_kv_heads,
+        top_k,
+        use_kernel,
+    ):
         super().__init__()
         assert n_heads % n_kv_heads == 0
         assert n_proxy_heads % n_proxy_kv_heads == 0
         assert n_heads % n_proxy_heads == 0
         assert head_dim % 2 == 0
 
-
         self.n_heads = n_heads
         self.n_kv_heads = n_kv_heads
         self.head_dim = head_dim
         self.num_groups = n_heads // n_kv_heads
         d_model = n_heads * head_dim
-        
+
         self.q_proj = nn.Linear(d_model, n_heads * head_dim, bias=False)
         self.k_proj = nn.Linear(d_model, n_kv_heads * head_dim, bias=False)
         self.v_proj = nn.Linear(d_model, n_kv_heads * head_dim, bias=False)
@@ -34,7 +43,7 @@ class Model(nn.Module):
         self.top_k = top_k
         self.block_size = 128
         self.use_kernel = use_kernel
-        self.kl_criterion = nn.KLDivLoss(reduction='batchmean')
+        self.kl_criterion = nn.KLDivLoss(reduction="batchmean")
 
     def apply_rope(self, x):
         # x shape: (B, S, H, D)
@@ -70,7 +79,7 @@ class Model(nn.Module):
 
         assert 1 <= top_k_blocks <= num_blocks
 
-        scaling = self.head_dim ** -0.5
+        scaling = self.head_dim**-0.5
 
         # Proxy QK.
         k_proxy = k_proxy.repeat_interleave(self.num_proxy_groups, dim=1)
@@ -83,9 +92,9 @@ class Model(nn.Module):
         proxy_scores = proxy_scores.masked_fill(proxy_mask, float("-inf"))
 
         # Block scores from max-pooled token scores.
-        block_scores = proxy_scores.view(
-            b, hp, s, num_blocks, self.block_size
-        ).amax(dim=-1)
+        block_scores = proxy_scores.view(b, hp, s, num_blocks, self.block_size).amax(
+            dim=-1
+        )
 
         # Force local block before top-k so the final selected set is fixed-size.
         seq_indices = torch.arange(s, device=q_proxy.device)
@@ -103,8 +112,7 @@ class Model(nn.Module):
         block_mask.scatter_(3, block_indices, True)
 
         token_mask = (
-            block_mask
-            .unsqueeze(-1)
+            block_mask.unsqueeze(-1)
             .expand(b, hp, s, num_blocks, self.block_size)
             .reshape(b, hp, s, s)
         )
@@ -160,18 +168,26 @@ class Model(nn.Module):
 
         main_attn_kl_target = main_attn_kl_target.masked_fill(~valid, 0.0)
 
-        kl_loss = F.kl_div(
-            input=proxy_logprobs,
-            target=main_attn_kl_target.detach(),
-            reduction="none",
-        ).sum(dim=-1).mean()
+        kl_loss = (
+            F.kl_div(
+                input=proxy_logprobs,
+                target=main_attn_kl_target.detach(),
+                reduction="none",
+            )
+            .sum(dim=-1)
+            .mean()
+        )
 
         return attn_out, kl_loss
 
     def forward(self, hidden_states):
         b, s, _ = hidden_states.shape
-        q_proxy = self.q_proxy(hidden_states).view(b, s, self.n_proxy_heads, self.head_dim)
-        k_proxy = self.k_proxy(hidden_states).view(b, s, self.n_proxy_kv_heads, self.head_dim)
+        q_proxy = self.q_proxy(hidden_states).view(
+            b, s, self.n_proxy_heads, self.head_dim
+        )
+        k_proxy = self.k_proxy(hidden_states).view(
+            b, s, self.n_proxy_kv_heads, self.head_dim
+        )
         q_proxy, k_proxy = self.apply_rope(q_proxy), self.apply_rope(k_proxy)
         q_proxy = q_proxy.transpose(1, 2)
         k_proxy = k_proxy.transpose(1, 2)
@@ -187,9 +203,17 @@ class Model(nn.Module):
         # QKV, qk_proxy: (B, H, S, D)
         # indexer_weights: (B, H, S)
         if self.use_kernel:
+            document_ids = torch.zeros((b, s), device=q.device, dtype=torch.int32)
             attn_out, kl_loss = flash_msa_func(
-                q_proxy, k_proxy, q, k, v,
-                self.top_k, self.head_dim ** -0.5)
+                q_proxy,
+                k_proxy,
+                q,
+                k,
+                v,
+                self.top_k,
+                self.head_dim**-0.5,
+                document_ids,
+            )
         else:
             attn_out, kl_loss = self._attention_eager(q_proxy, k_proxy, q, k, v)
         return attn_out, kl_loss

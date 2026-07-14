@@ -56,7 +56,7 @@ def dense_main_attention(
     k: torch.Tensor,
     v: torch.Tensor,
     scale: float,
-    document_list: torch.Tensor | None = None,
+    document_list: torch.Tensor | None,
     *,
     cu_seqlens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -84,7 +84,7 @@ def dense_proxy_vjp(
     k: torch.Tensor,
     lse_main: torch.Tensor,
     scale: float,
-    document_list: torch.Tensor | None = None,
+    document_list: torch.Tensor | None,
     *,
     cu_seqlens: torch.Tensor | None = None,
     kl_metric: torch.Tensor | None = None,
@@ -139,66 +139,6 @@ def dense_proxy_vjp(
     )
 
 
-class _WarmupSparseAttentionFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx,
-        q_proxy: torch.Tensor,
-        k_proxy: torch.Tensor,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        top_k: int,
-        scale: float,
-        document_ids: torch.Tensor,
-        kl_metric: torch.Tensor,
-        record_kl_metric: bool,
-    ):
-        _ = int(top_k)
-        _validate_inputs(q_proxy, k_proxy, q, k, v)
-        if q.device.type != "cuda":
-            raise RuntimeError("warmup MSA forward requires CUDA tensors")
-
-        from flash_msa.warmup.msa_forward_cutedsl_warmup import run_main_forward
-
-        o_main, lse_main, kl_loss = run_main_forward(
-            q, k, v, scale=float(scale), document_ids=document_ids
-        )
-        out = o_main.transpose(1, 2).reshape(q.shape[0], q.shape[2], -1)
-
-        ctx.save_for_backward(q_proxy, k_proxy, q, k, v, lse_main, o_main, document_ids)
-        ctx.scale = float(scale)
-        ctx.kl_metric = kl_metric
-        ctx.record_kl_metric = bool(record_kl_metric)
-        if ctx.record_kl_metric:
-            kl_metric.zero_()
-        ctx.set_materialize_grads(False)
-        return out, kl_loss
-
-    @staticmethod
-    def backward(ctx, grad_out: torch.Tensor | None, grad_kl: torch.Tensor | None):
-        q_proxy, k_proxy, q, k, v, lse_main, o_main, document_ids = ctx.saved_tensors
-
-        from flash_msa.warmup.msa_backward_cutedsl_warmup import run_warmup_backward
-
-        dq_proxy, dk_proxy, dq, dk, dv = run_warmup_backward(
-            q_proxy,
-            k_proxy,
-            q,
-            k,
-            v,
-            lse_main,
-            o_main,
-            grad_out,
-            grad_kl,
-            document_ids,
-            ctx.kl_metric,
-            scale=ctx.scale,
-            record_kl_metric=ctx.record_kl_metric,
-        )
-        return dq_proxy, dk_proxy, dq, dk, dv, None, None, None, None, None
-
-
 def sparse_attention_warmup(
     q_proxy: torch.Tensor,
     k_proxy: torch.Tensor,
@@ -207,28 +147,35 @@ def sparse_attention_warmup(
     v: torch.Tensor,
     top_k: int,
     scale: float,
-    document_list: torch.Tensor | None = None,
+    document_list: torch.Tensor | None,
     *,
     cu_seqlens: torch.Tensor | None = None,
     kl_metric: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute dense causal warmup attention and proxy-KL gradients."""
 
-    document_list = resolve_document_ids(q, document_list, cu_seqlens)
-    record_kl_metric = kl_metric is not None
-    if kl_metric is None:
-        kl_metric = torch.empty((), device=q.device, dtype=torch.float32)
-    else:
-        assert kl_metric.shape == () and kl_metric.dtype == torch.float32
-    return _WarmupSparseAttentionFunction.apply(
+    del top_k
+    _validate_inputs(q_proxy, k_proxy, q, k, v)
+    out, lse_main = dense_main_attention(
+        q.transpose(1, 2).contiguous(),
+        k.transpose(1, 2).contiguous(),
+        v.transpose(1, 2).contiguous(),
+        float(scale),
+        document_list,
+        cu_seqlens=cu_seqlens,
+    )
+    dq_proxy, dk_proxy = dense_proxy_vjp(
         q_proxy,
         k_proxy,
         q,
         k,
-        v,
-        int(top_k),
+        lse_main,
         float(scale),
         document_list,
-        kl_metric,
-        record_kl_metric,
+        cu_seqlens=cu_seqlens,
+        kl_metric=kl_metric,
     )
+    proxy_carrier = (q_proxy * dq_proxy.detach()).sum() + (
+        k_proxy * dk_proxy.detach()
+    ).sum()
+    return out, proxy_carrier - proxy_carrier.detach()

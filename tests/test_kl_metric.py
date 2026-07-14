@@ -42,6 +42,7 @@ def test_kl_metric_matches_eager(kernel, reference_cls, top_k) -> None:
     )
     expected = reference._attention_eager(q_proxy, k_proxy, q, k, v)[1].detach()
     metric = torch.full((), -1.0, device="cuda")
+    document_ids = torch.zeros((batch, seq_len), device="cuda", dtype=torch.int32)
 
     output, _ = kernel(
         q_proxy,
@@ -51,9 +52,11 @@ def test_kl_metric_matches_eager(kernel, reference_cls, top_k) -> None:
         v,
         top_k,
         head_dim**-0.5,
+        document_ids,
         kl_metric=metric,
     )
-    assert metric == 0.0
+    actual = metric.clone()
+    torch.testing.assert_close(actual, expected.float(), atol=1e-3, rtol=1e-2)
     output.float().square().mean().backward()
 
-    torch.testing.assert_close(metric, expected.float(), atol=1e-3, rtol=1e-2)
+    torch.testing.assert_close(metric, actual)

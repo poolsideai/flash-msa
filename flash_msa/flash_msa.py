@@ -5,16 +5,14 @@ This module owns the Python boundary for the native fused MSA kernels.
 
 import torch
 
-from flash_msa.msa_select_cutedsl import compute_proxy_lse, select_blocks
+from flash_msa.msa_select_cutedsl import select_blocks
 from flash_msa.msa_backward_cutedsl import (
     _derive_head_tiling,
-    run_fused_backward,
     run_main_backward,
-    run_proxy_backward,
 )
 from flash_msa.msa_forward_cutedsl import run_main_forward
+from flash_msa.proxy_backward_triton import run_triton_proxy_vjp
 from flash_msa.reverse_index_cuda import (
-    BlockSparseSelection,
     SparseAttentionMetadata,
     build_sparse_attention_metadata_cuda,
     resolve_document_ids,
@@ -89,7 +87,7 @@ def prepare_sparse_attention(
     v: torch.Tensor,
     top_k: int,
     scale: float,
-    document_list: torch.Tensor | None = None,
+    document_list: torch.Tensor | None,
     *,
     cu_seqlens: torch.Tensor | None = None,
 ) -> SparseAttentionMetadata:
@@ -219,240 +217,17 @@ def sparse_proxy_vjp(
     else:
         assert kl_metric.shape == () and kl_metric.dtype == torch.float32
         kl_metric.zero_()
-    lse_proxy = compute_proxy_lse(
-        q_proxy,
-        k_proxy,
-        scale=float(scale),
-        metadata=metadata,
-    )
-    normalization = 1.0 / float(q.shape[0] * q_proxy.shape[1] * q.shape[2])
-    return run_proxy_backward(
+    return run_triton_proxy_vjp(
         q_proxy,
         k_proxy,
         q,
         k,
         lse_main,
-        lse_proxy,
-        metadata.task_meta,
-        metadata.task_qids,
-        metadata.document_ids,
-        kl_metric,
+        metadata,
         scale=float(scale),
-        normalization=normalization,
+        kl_metric=kl_metric,
         record_kl_metric=record_kl_metric,
     )
-
-
-def _run_fused_selected_edge_backward(
-    q_proxy: torch.Tensor,
-    k_proxy: torch.Tensor,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    lse_main: torch.Tensor,
-    o_main: torch.Tensor,
-    grad_o_main: torch.Tensor,
-    grad_kl: torch.Tensor | None,
-    metadata: SparseAttentionMetadata,
-    kl_metric: torch.Tensor,
-    *,
-    scale: float,
-    record_kl_metric: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run the native reverse-index fused selected-edge backward."""
-
-    bsz, n_heads, seq_len, _ = q.shape
-    n_proxy_heads = q_proxy.shape[1]
-
-    lse_proxy = (
-        compute_proxy_lse(
-            q_proxy,
-            k_proxy,
-            scale=float(scale),
-            metadata=metadata,
-        )
-        if grad_kl is not None or record_kl_metric
-        else torch.empty(
-            (bsz, n_proxy_heads, seq_len),
-            device=q.device,
-            dtype=torch.float32,
-        )
-    )
-
-    delta_main = (o_main.float() * grad_o_main.float()).sum(dim=-1)
-    # Proxy KL gradients are linear in the upstream scalar.  Run the native
-    # kernel at the static normalization scale, then apply the CUDA scalar to
-    # only the proxy gradients.  This avoids the synchronizing ``.item()`` that
-    # would otherwise be needed for a by-value CuTeDSL kernel argument.
-    normalization = 1.0 / float(bsz * n_proxy_heads * seq_len)
-    proxy_grad_scale = 0.0 if grad_kl is None else normalization
-    dq_proxy, dk_proxy, dq, dk, dv = run_fused_backward(
-        q_proxy,
-        k_proxy,
-        q,
-        k,
-        v,
-        grad_o_main,
-        lse_main,
-        lse_proxy,
-        delta_main,
-        metadata.task_meta,
-        metadata.task_qids,
-        metadata.document_ids,
-        kl_metric,
-        scale=float(scale),
-        grad_kl_scale=proxy_grad_scale,
-        kl_metric_scale=normalization if record_kl_metric else 0.0,
-        record_kl_metric=record_kl_metric,
-    )
-    if grad_kl is not None:
-        proxy_multiplier = grad_kl.detach().to(device=q.device, dtype=dq_proxy.dtype)
-        dq_proxy = dq_proxy * proxy_multiplier
-        dk_proxy = dk_proxy * proxy_multiplier.to(dtype=dk_proxy.dtype)
-    return dq_proxy, dk_proxy, dq, dk, dv
-
-
-class _SparseAttentionFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx,
-        q_proxy: torch.Tensor,
-        k_proxy: torch.Tensor,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        top_k: int,
-        scale: float,
-        document_ids: torch.Tensor,
-        kl_metric: torch.Tensor,
-        record_kl_metric: bool,
-    ):
-        b, n_proxy_heads, s, head_dim = q_proxy.shape
-        n_heads = q.shape[1]
-        n_kv_heads = k.shape[1]
-        num_blocks, top_k_blocks = _validate_inputs(
-            q_proxy, k_proxy, q, k, v, int(top_k)
-        )
-        block_indices = select_blocks(
-            q_proxy,
-            k_proxy,
-            document_ids=document_ids,
-            scale=float(scale),
-            num_blocks=num_blocks,
-            top_k_blocks=top_k_blocks,
-        )
-
-        _main_per_proxy, query_chunk, _rows_per_task, _proxy_rows = _derive_head_tiling(
-            n_heads, n_kv_heads, n_proxy_heads
-        )
-        metadata = build_sparse_attention_metadata_cuda(
-            block_indices,
-            n_main_heads=n_heads,
-            backward_query_chunk=2 * query_chunk,
-            document_ids=document_ids,
-        )
-
-        o_main, lse_main, kl_loss = run_main_forward(
-            q,
-            k,
-            v,
-            scale=float(scale),
-            metadata=metadata,
-        )
-
-        out = o_main.transpose(1, 2).reshape(b, s, -1)
-
-        save_tensors = (
-            q_proxy,
-            k_proxy,
-            q,
-            k,
-            v,
-            lse_main,
-            o_main,
-            metadata.task_meta,
-            metadata.task_qids,
-            metadata.document_ids,
-            metadata.selection.indices,
-            metadata.selection.counts,
-            metadata.selection.proxy_block_counts,
-            metadata.selection.proxy_block_indices,
-            metadata.selection.proxy_empty_block_counts,
-        )
-        ctx.save_for_backward(*save_tensors)
-        ctx.query_block_size = metadata.query_block_size
-        ctx.scale = float(scale)
-        ctx.kl_metric = kl_metric
-        ctx.record_kl_metric = bool(record_kl_metric)
-        if ctx.record_kl_metric:
-            kl_metric.zero_()
-        ctx.set_materialize_grads(False)
-        return out, kl_loss
-
-    @staticmethod
-    def backward(ctx, grad_out: torch.Tensor | None, grad_kl: torch.Tensor | None):
-        common_tensors = ctx.saved_tensors[:15]
-        (
-            q_proxy,
-            k_proxy,
-            q,
-            k,
-            v,
-            lse_main,
-            o_main,
-            task_meta,
-            task_qids,
-            document_ids,
-            block_indices,
-            block_counts,
-            proxy_block_counts,
-            proxy_block_indices,
-            proxy_empty_block_counts,
-        ) = common_tensors
-        proxy_selection = BlockSparseSelection(
-            indices=block_indices,
-            counts=block_counts,
-            proxy_block_counts=proxy_block_counts,
-            proxy_block_indices=proxy_block_indices,
-            proxy_empty_block_counts=proxy_empty_block_counts,
-            main_block_counts=proxy_block_counts,
-            main_block_indices=proxy_block_indices,
-            main_empty_block_counts=proxy_empty_block_counts,
-        )
-        metadata = SparseAttentionMetadata(
-            selection=proxy_selection,
-            task_meta=task_meta,
-            task_qids=task_qids,
-            document_ids=document_ids,
-            query_block_size=ctx.query_block_size,
-        )
-
-        if grad_out is None:
-            grad_o_main = torch.zeros_like(o_main)
-        else:
-            b, s, _ = grad_out.shape
-            grad_o_main = (
-                grad_out.reshape(b, s, q.shape[1], q.shape[3])
-                .transpose(1, 2)
-                .contiguous()
-            )
-
-        dq_proxy, dk_proxy, dq, dk, dv = _run_fused_selected_edge_backward(
-            q_proxy,
-            k_proxy,
-            q,
-            k,
-            v,
-            lse_main,
-            o_main,
-            grad_o_main,
-            grad_kl,
-            metadata,
-            ctx.kl_metric,
-            scale=ctx.scale,
-            record_kl_metric=ctx.record_kl_metric,
-        )
-        return dq_proxy, dk_proxy, dq, dk, dv, None, None, None, None, None
 
 
 def sparse_attention(
@@ -463,7 +238,7 @@ def sparse_attention(
     v: torch.Tensor,
     top_k: int,
     scale: float,
-    document_list: torch.Tensor | None = None,
+    document_list: torch.Tensor | None,
     *,
     cu_seqlens: torch.Tensor | None = None,
     kl_metric: torch.Tensor | None = None,
@@ -474,13 +249,7 @@ def sparse_attention(
     batch-row boundary. It is expanded entirely on CUDA so packed attention
     does not add a device-to-host synchronization.
     """
-    document_list = resolve_document_ids(q, document_list, cu_seqlens)
-    record_kl_metric = kl_metric is not None
-    if kl_metric is None:
-        kl_metric = torch.empty((), device=q.device, dtype=torch.float32)
-    else:
-        assert kl_metric.shape == () and kl_metric.dtype == torch.float32
-    return _SparseAttentionFunction.apply(
+    metadata = prepare_sparse_attention(
         q_proxy,
         k_proxy,
         q,
@@ -489,6 +258,20 @@ def sparse_attention(
         int(top_k),
         float(scale),
         document_list,
-        kl_metric,
-        record_kl_metric,
+        cu_seqlens=cu_seqlens,
     )
+    out, lse_main = sparse_main_attention(q, k, v, metadata, float(scale))
+    dq_proxy, dk_proxy = sparse_proxy_vjp(
+        q_proxy,
+        k_proxy,
+        q,
+        k,
+        lse_main,
+        metadata,
+        float(scale),
+        kl_metric=kl_metric,
+    )
+    proxy_carrier = (q_proxy * dq_proxy.detach()).sum() + (
+        k_proxy * dk_proxy.detach()
+    ).sum()
+    return out, proxy_carrier - proxy_carrier.detach()

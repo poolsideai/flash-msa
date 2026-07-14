@@ -141,14 +141,24 @@ def test_sparse_gqa_document_mask_matches_eager_oracle() -> None:
     )
     top_values, expected_blocks = block_scores.topk(top_k_blocks, dim=-1)
     expected_blocks = expected_blocks.masked_fill(top_values.isneginf(), num_blocks)
-    torch.testing.assert_close(
-        metadata.selection.indices.sort(dim=-1).values,
-        expected_blocks.sort(dim=-1).values.to(torch.int32),
-    )
-
     block_mask = torch.zeros_like(block_scores, dtype=torch.bool)
     valid_blocks = expected_blocks < num_blocks
     block_mask.scatter_(3, expected_blocks.clamp_max(num_blocks - 1), valid_blocks)
+    membership_bits = torch.zeros_like(metadata.selection.membership_bits)
+    expected_blocks_i32 = expected_blocks.to(torch.int32)
+    membership_bits.scatter_add_(
+        3,
+        expected_blocks.clamp_max(num_blocks - 1).div(32, rounding_mode="floor"),
+        torch.where(
+            valid_blocks,
+            torch.bitwise_left_shift(
+                torch.ones_like(expected_blocks_i32),
+                expected_blocks_i32.remainder(32),
+            ),
+            0,
+        ),
+    )
+    torch.testing.assert_close(metadata.selection.membership_bits, membership_bits)
     token_mask = (
         block_mask[..., None]
         .expand(batch, n_proxy_heads, seq_len, num_blocks, 128)
@@ -170,6 +180,29 @@ def test_sparse_gqa_document_mask_matches_eager_oracle() -> None:
 
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(actual_lse, expected_lse, atol=2e-5, rtol=2e-5)
+
+
+def test_membership_bitset_preserves_bit_31() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+
+    selected = torch.full(
+        (1, 1, 4096, 1),
+        31,
+        device="cuda",
+        dtype=torch.int32,
+    )
+    selection = build_block_sparse_selection(
+        selected,
+        n_main_heads=1,
+        query_block_size=128,
+    )
+
+    assert selection.membership_bits.shape == (1, 1, 4096, 1)
+    torch.testing.assert_close(
+        selection.membership_bits,
+        torch.full_like(selection.membership_bits, torch.iinfo(torch.int32).min),
+    )
 
 
 @pytest.mark.parametrize("kernel", [flash_msa_func, flash_msa_warmup_func])
