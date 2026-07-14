@@ -10,6 +10,7 @@ import triton
 import triton.language as tl
 
 from flash_msa._flash_attn_compat import (
+    flash_attn_fixed_forward,
     flash_attn_supports_narrow_value_dim,
     flash_attn_varlen_forward,
     flash_attn_varlen_paged_forward,
@@ -37,6 +38,28 @@ def _causal_document_mask(
     document_ids = aux_tensors[0]
     q_global = q_idx + seqlen_info.offset_q
     kv_global = kv_idx + seqlen_info.offset_k
+    q_pos = cute.make_rmem_tensor(1, cutlass.Int32)
+    kv_pos = cute.make_rmem_tensor(1, cutlass.Int32)
+    q_pos.store(q_global)
+    kv_pos.store(kv_global)
+    q_document = utils.scalar_to_ssa(document_ids[q_pos[0]], cutlass.Int32)
+    kv_document = utils.scalar_to_ssa(document_ids[kv_pos[0]], cutlass.Int32)
+    return (kv_idx <= q_idx) & (q_document == kv_document)
+
+
+@cute.jit
+def _block_causal_document_mask(
+    batch: cute.TensorSSA,
+    head: cute.TensorSSA,
+    q_idx: cute.TensorSSA,
+    kv_idx: cute.TensorSSA,
+    seqlen_info,
+    aux_tensors: list,
+) -> cute.TensorSSA:
+    document_ids = aux_tensors[0]
+    block_size = cutlass.Int32(BLOCK_SIZE)
+    q_global = batch[0] * block_size + q_idx
+    kv_global = batch[0] * block_size + kv_idx
     q_pos = cute.make_rmem_tensor(1, cutlass.Int32)
     kv_pos = cute.make_rmem_tensor(1, cutlass.Int32)
     q_pos.store(q_global)
@@ -94,6 +117,36 @@ def _local_block_attention(
     value_dim = int(v.shape[-1])
     total_tokens = batch * seq_len
     num_sequences = total_tokens // BLOCK_SIZE
+
+    def to_blocks(tensor: torch.Tensor) -> torch.Tensor:
+        return (
+            tensor.transpose(1, 2)
+            .contiguous()
+            .view(
+                num_sequences,
+                BLOCK_SIZE,
+                tensor.shape[1],
+                tensor.shape[-1],
+            )
+        )
+
+    q_blocks, k_blocks, v_blocks = map(to_blocks, (q, k, v))
+    fixed_result = flash_attn_fixed_forward(
+        q=q_blocks,
+        k=k_blocks,
+        v=v_blocks,
+        softmax_scale=float(scale),
+        causal=not document_ids.numel(),
+        mask_mod=_block_causal_document_mask if document_ids.numel() else None,
+        aux_tensors=[document_ids.reshape(-1)] if document_ids.numel() else None,
+    )
+    if fixed_result is not None:
+        out, lse = fixed_result
+        return (
+            out.view(total_tokens, n_heads, value_dim),
+            lse.permute(1, 0, 2).reshape(n_heads, total_tokens),
+        )
+
     cu_seqlens = (
         torch.arange(
             num_sequences + 1,
@@ -103,9 +156,9 @@ def _local_block_attention(
         * BLOCK_SIZE
     )
 
-    q_tokens = q.transpose(1, 2).contiguous().view(total_tokens, n_heads, head_dim)
-    k_tokens = k.transpose(1, 2).contiguous().view(total_tokens, n_kv_heads, head_dim)
-    v_tokens = v.transpose(1, 2).contiguous().view(total_tokens, n_kv_heads, value_dim)
+    q_tokens = q_blocks.view(total_tokens, n_heads, head_dim)
+    k_tokens = k_blocks.view(total_tokens, n_kv_heads, head_dim)
+    v_tokens = v_blocks.view(total_tokens, n_kv_heads, value_dim)
     return flash_attn_varlen_forward(
         q=q_tokens,
         k=k_tokens,

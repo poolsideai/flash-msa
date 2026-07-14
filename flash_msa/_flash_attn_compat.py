@@ -38,6 +38,34 @@ def flash_attn_supports_narrow_value_dim() -> bool:
     return _fa4_varlen_func() is not None
 
 
+def flash_attn_fixed_forward(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: float,
+    causal: bool,
+    mask_mod: Callable | None = None,
+    aux_tensors: list[torch.Tensor] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Use fixed-length FA4 forward, or return ``None`` on FA3 installs."""
+
+    flash_attn_func = _fa4_varlen_func()
+    if flash_attn_func is None:
+        return None
+    out, lse = flash_attn_func(
+        q,
+        k,
+        v,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        mask_mod=mask_mod,
+        aux_tensors=aux_tensors,
+        return_lse=True,
+    )
+    return out, lse
+
+
 def flash_attn_varlen_paged_forward(
     *,
     q: torch.Tensor,
