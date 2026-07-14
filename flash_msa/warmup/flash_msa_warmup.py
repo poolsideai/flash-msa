@@ -62,17 +62,19 @@ def dense_main_attention(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run dense warmup attention through FlashAttention autograd."""
 
-    document_ids = resolve_document_ids(q, document_list, cu_seqlens)
-    from flash_msa.warmup.msa_forward_cutedsl_warmup import run_main_forward
+    document_ids = resolve_document_ids(q, document_list, cu_seqlens, seq_dim=1)
+    from flash_msa.warmup.msa_forward_cutedsl_warmup import (
+        run_main_forward_token_major,
+    )
 
-    o_main, lse_main, _kl_loss = run_main_forward(
+    o_main, lse_main, _kl_loss = run_main_forward_token_major(
         q,
         k,
         v,
         scale=float(scale),
         document_ids=document_ids,
     )
-    return o_main.transpose(1, 2).reshape(q.shape[0], q.shape[2], -1), lse_main
+    return o_main.reshape(q.shape[0], q.shape[1], -1), lse_main
 
 
 def dense_proxy_vjp(

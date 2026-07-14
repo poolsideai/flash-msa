@@ -145,10 +145,13 @@ def test_decomposed_main_and_indexer_gradients_match_combined(dense: bool) -> No
     (reference_out * grad_out).sum().add(reference_aux).backward()
 
     if dense:
+        q_tokens = candidate["q"].transpose(1, 2).contiguous()
+        k_tokens = candidate["k"].transpose(1, 2).contiguous()
+        v_tokens = candidate["v"].transpose(1, 2).contiguous()
         candidate_out, lse = dense_main_attention(
-            candidate["q"],
-            candidate["k"],
-            candidate["v"],
+            q_tokens,
+            k_tokens,
+            v_tokens,
             scale,
             document_ids,
         )
@@ -172,13 +175,30 @@ def test_decomposed_main_and_indexer_gradients_match_combined(dense: bool) -> No
             scale,
             document_ids,
         )
-        candidate_out, lse = sparse_main_attention(
-            candidate["q"],
-            candidate["k"],
-            candidate["v"],
-            metadata,
-            scale,
+        saved_tensor_ids: set[int] = set()
+
+        def record_saved_tensor(tensor: torch.Tensor) -> torch.Tensor:
+            saved_tensor_ids.add(id(tensor))
+            return tensor
+
+        with torch.autograd.graph.saved_tensors_hooks(
+            record_saved_tensor, lambda tensor: tensor
+        ):
+            candidate_out, lse = sparse_main_attention(
+                candidate["q"],
+                candidate["k"],
+                candidate["v"],
+                metadata,
+                scale,
+            )
+        forward_only_metadata = (
+            metadata.remote_destinations,
+            metadata.remote_positions,
+            metadata.remote_cu_seqlens,
+            metadata.remote_q_document_ids,
+            metadata.remote_k_document_ids,
         )
+        assert saved_tensor_ids.isdisjoint(map(id, forward_only_metadata))
         dq_proxy, dk_proxy = sparse_proxy_vjp(
             candidate["q_proxy"],
             candidate["k_proxy"],

@@ -123,13 +123,6 @@ def prepare_sparse_attention(
     )
 
 
-def _restore_metadata(
-    tensors: tuple[torch.Tensor, ...],
-    shape: tuple[int, int, int, int],
-) -> SparseAttentionMetadata:
-    return SparseAttentionMetadata(*tensors, *shape)
-
-
 class _SparseMainAttentionFunction(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -147,23 +140,17 @@ class _SparseMainAttentionFunction(torch.autograd.Function):
             scale=float(scale),
             metadata=metadata,
         )
-        metadata_tensors = (
+        ctx.save_for_backward(
+            q,
+            k,
+            v,
+            lse_main,
+            o_main,
             metadata.task_meta,
             metadata.task_qids,
-            metadata.remote_destinations,
-            metadata.remote_positions,
-            metadata.remote_cu_seqlens,
             metadata.document_ids,
-            metadata.remote_q_document_ids,
-            metadata.remote_k_document_ids,
         )
-        ctx.save_for_backward(q, k, v, lse_main, o_main, *metadata_tensors)
-        ctx.metadata_shape = (
-            metadata.batch,
-            metadata.n_proxy_heads,
-            metadata.seq_len,
-            metadata.top_k_blocks,
-        )
+        ctx.n_proxy_heads = metadata.n_proxy_heads
         ctx.scale = float(scale)
         ctx.mark_non_differentiable(lse_main)
         ctx.set_materialize_grads(False)
@@ -172,7 +159,9 @@ class _SparseMainAttentionFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor | None, _grad_lse: torch.Tensor | None):
-        q, k, v, lse_main, o_main, *metadata_tensors = ctx.saved_tensors
+        q, k, v, lse_main, o_main, task_meta, task_qids, document_ids = (
+            ctx.saved_tensors
+        )
         if grad_out is None:
             grad_o_main = torch.zeros_like(o_main)
         else:
@@ -181,7 +170,6 @@ class _SparseMainAttentionFunction(torch.autograd.Function):
                 .transpose(1, 2)
                 .contiguous()
             )
-        metadata = _restore_metadata(tuple(metadata_tensors), ctx.metadata_shape)
         dq, dk, dv = run_main_backward(
             q,
             k,
@@ -189,10 +177,10 @@ class _SparseMainAttentionFunction(torch.autograd.Function):
             grad_o_main,
             lse_main,
             o_main,
-            metadata.task_meta,
-            metadata.task_qids,
-            metadata.document_ids,
-            n_proxy_heads=metadata.n_proxy_heads,
+            task_meta,
+            task_qids,
+            document_ids,
+            n_proxy_heads=ctx.n_proxy_heads,
             scale=ctx.scale,
         )
         return dq, dk, dv, None, None

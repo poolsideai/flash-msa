@@ -36,27 +36,53 @@ def run_main_forward(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run dense causal main attention and return ``(O_main, LSE_main, kl_loss)``."""
 
+    o_main, lse_main, kl_loss = run_main_forward_token_major(
+        q.transpose(1, 2).contiguous(),
+        k.transpose(1, 2).contiguous(),
+        v.transpose(1, 2).contiguous(),
+        scale=scale,
+        document_ids=document_ids,
+    )
+    return o_main.transpose(1, 2).contiguous(), lse_main, kl_loss
+
+
+def run_main_forward_token_major(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    scale: float,
+    document_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run dense causal main attention without changing the token-major layout."""
+
     if q.device.type != "cuda":
         raise ValueError("warmup MSA forward requires CUDA tensors")
     if q.dtype not in (torch.float16, torch.bfloat16):
         raise TypeError(f"warmup MSA forward supports fp16/bf16, got {q.dtype}")
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
-        raise ValueError("q, k, and v must have shape (B, H, S, D)")
+        raise ValueError("q, k, and v must have shape (B, S, H, D)")
 
-    batch, n_heads, seq_len, head_dim = q.shape
-    if k.shape[0] != batch or v.shape[0] != batch or k.shape[2:] != q.shape[2:]:
+    batch, seq_len, n_heads, head_dim = q.shape
+    if k.shape[:2] != (batch, seq_len) or v.shape[:2] != (batch, seq_len):
         raise ValueError(
             "q, k, and v must agree on batch, sequence, and head dimension"
         )
     if v.shape != k.shape:
         raise ValueError("k and v must have the same shape")
-    n_kv_heads = k.shape[1]
+    if k.shape[-1] != head_dim:
+        raise ValueError(
+            "q, k, and v must agree on batch, sequence, and head dimension"
+        )
+    if not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous():
+        raise ValueError("token-major q, k, and v must be contiguous")
+    n_kv_heads = k.shape[2]
     if n_heads % n_kv_heads != 0:
         raise ValueError("n_heads must be divisible by n_kv_heads")
 
-    q_pack = q.transpose(1, 2).contiguous().view(batch * seq_len, n_heads, head_dim)
-    k_pack = k.transpose(1, 2).contiguous().view(batch * seq_len, n_kv_heads, head_dim)
-    v_pack = v.transpose(1, 2).contiguous().view(batch * seq_len, n_kv_heads, head_dim)
+    q_pack = q.view(batch * seq_len, n_heads, head_dim)
+    k_pack = k.view(batch * seq_len, n_kv_heads, head_dim)
+    v_pack = v.view(batch * seq_len, n_kv_heads, head_dim)
     cu_seqlens = torch.arange(batch + 1, device=q.device, dtype=torch.int32) * int(
         seq_len
     )
@@ -77,9 +103,7 @@ def run_main_forward(
         aux_tensors=[document_ids.reshape(-1)] if document_ids.numel() else None,
     )
 
-    o_main = (
-        out.view(batch, seq_len, n_heads, head_dim).permute(0, 2, 1, 3).contiguous()
-    )
+    o_main = out.view(batch, seq_len, n_heads, head_dim)
     lse_main = _lse_from_flash(lse, batch=batch, n_heads=n_heads, seq_len=seq_len)
     kl_loss = torch.zeros((), dtype=torch.float32, device=q.device)
     return o_main, lse_main, kl_loss

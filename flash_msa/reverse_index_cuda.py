@@ -175,6 +175,8 @@ def resolve_document_ids(
     q: torch.Tensor,
     document_list: torch.Tensor | None,
     cu_seqlens: torch.Tensor | None,
+    *,
+    seq_dim: int = 2,
 ) -> torch.Tensor:
     """Return the device document IDs accepted by the native kernels."""
 
@@ -184,7 +186,7 @@ def resolve_document_ids(
         document_list = document_ids_from_cu_seqlens(
             cu_seqlens,
             batch_size=q.shape[0],
-            seq_len=q.shape[2],
+            seq_len=q.shape[seq_dim],
         )
     if document_list is None:
         return torch.empty(0, device=q.device, dtype=torch.int32)
