@@ -14,7 +14,13 @@ More information is included in the [blog post](https://nanduruganesh.github.io/
 
 # Installation
 
-flash-msa depends on FA3/4 from [flash-attn](https://github.com/dao-ailab/flash-attention). Try to configure your CUDA/Python/Torch versions to match one of the flash-attn wheels for a fast installation, but if you must build from source, set `MAX_JOBS=<max jobs>` to avoid `pip install flash-msa[attn]` bricking your CPU.
+The sparse training path requires FA4 block-sparse attention at commit `6a94f8b906cf5ab944385d64707f9387f3dd6be9`, which adds compact block-index tensors. Dense warmup also supports FA3. Install the pinned FA4 dependency with:
+
+```
+uv pip install 'flash-msa[fa4]'
+```
+
+If you must build from source, set `MAX_JOBS=<max jobs>` to avoid exhausting host memory.
 
 You will also need Python headers, e.g. `apt-get install python3.12-dev`, for whichever python version you are using.
 
@@ -109,10 +115,11 @@ dQ_proxy, dK_proxy = sparse_proxy_vjp(
 
 Apply `dQ_proxy` and `dK_proxy` to the Indexer projection while its short-lived
 autograd graph is still available. The ordinary backward of
-`sparse_main_attention` computes only main Q/K/V gradients. `metadata` is the
-complete immutable selection and packed schedule, so a checkpoint replay can
-reuse it without rerunning selection or packing. Dense warmup provides the same
-split through `dense_main_attention` and `dense_proxy_vjp`.
+`sparse_main_attention` computes only main Q/K/V gradients. `metadata` holds the
+compact token selections and forward/backward schedules, so a checkpoint replay
+can reuse them without rerunning selection or rebuilding either schedule. Dense
+warmup provides the same split through `dense_main_attention` and
+`dense_proxy_vjp`.
 
 # Caveats
 

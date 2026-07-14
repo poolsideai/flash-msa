@@ -1,8 +1,16 @@
 import pytest
 import torch
 
-from flash_msa import flash_msa_func, flash_msa_warmup_func
-from flash_msa.reverse_index_cuda import build_dense_causal_schedule_cuda
+from flash_msa import (
+    flash_msa_func,
+    flash_msa_warmup_func,
+    prepare_sparse_attention,
+    sparse_main_attention,
+)
+from flash_msa.reverse_index_cuda import (
+    build_block_sparse_selection,
+    build_dense_causal_schedule_cuda,
+)
 
 
 def test_dense_warmup_schedule_is_built_on_cuda() -> None:
@@ -35,6 +43,133 @@ def test_dense_warmup_schedule_is_built_on_cuda() -> None:
                     dtype=torch.int32,
                 )
                 torch.testing.assert_close(actual, expected)
+
+
+def test_blackwell_schedule_unions_256_token_query_blocks() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+
+    positions = torch.arange(512, device="cuda", dtype=torch.int32)
+    local_blocks = (positions // 128).view(1, 1, 512, 1).expand(1, 2, -1, -1)
+    sentinels = torch.full_like(local_blocks, 4)
+    selection = build_block_sparse_selection(
+        torch.cat((local_blocks, sentinels), dim=-1),
+        n_main_heads=8,
+        query_block_size=256,
+    )
+
+    assert selection.proxy_block_counts.shape == (1, 2, 2)
+    assert selection.main_block_counts.shape == (1, 8, 2)
+    torch.testing.assert_close(
+        selection.proxy_block_counts,
+        torch.full((1, 2, 2), 2, device="cuda", dtype=torch.int32),
+    )
+
+
+def test_sparse_gqa_document_mask_matches_eager_oracle() -> None:
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip("FA4 sparse oracle is an SM90 regression")
+
+    torch.manual_seed(19)
+    batch, seq_len, head_dim = 1, 512, 128
+    n_heads, n_kv_heads = 8, 2
+    n_proxy_heads, n_proxy_kv_heads = 4, 2
+    top_k = 256
+    scale = head_dim**-0.5
+    documents = torch.empty(batch, seq_len, device="cuda", dtype=torch.int32)
+    documents[:, :173] = 0
+    documents[:, 173:381] = 1
+    documents[:, 381:] = 2
+
+    def rand(heads: int) -> torch.Tensor:
+        return torch.randn(
+            batch,
+            heads,
+            seq_len,
+            head_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+
+    q_proxy, k_proxy = rand(n_proxy_heads), rand(n_proxy_kv_heads)
+    q, k, v = (
+        torch.randn(
+            batch,
+            seq_len,
+            heads,
+            head_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+        ).transpose(1, 2)
+        for heads in (n_heads, n_kv_heads, n_kv_heads)
+    )
+    metadata = prepare_sparse_attention(
+        q_proxy,
+        k_proxy,
+        q,
+        k,
+        v,
+        top_k,
+        scale,
+        documents,
+    )
+    actual, actual_lse = sparse_main_attention(q, k, v, metadata, scale)
+
+    num_blocks = seq_len // 128
+    top_k_blocks = top_k // 128
+    proxy_k = k_proxy.repeat_interleave(
+        n_proxy_heads // n_proxy_kv_heads,
+        dim=1,
+    )
+    proxy_scores = (q_proxy @ proxy_k.transpose(-2, -1)) * scale
+    positions = torch.arange(seq_len, device="cuda")
+    valid = positions[None, :] <= positions[:, None]
+    valid = valid[None, None] & (
+        documents[:, None, :, None] == documents[:, None, None, :]
+    )
+    proxy_scores = proxy_scores.masked_fill(~valid, float("-inf"))
+    block_scores = proxy_scores.view(
+        batch,
+        n_proxy_heads,
+        seq_len,
+        num_blocks,
+        128,
+    ).amax(dim=-1)
+    local_blocks = (positions // 128).view(1, 1, seq_len, 1)
+    block_scores.scatter_(
+        3, local_blocks.expand(batch, n_proxy_heads, -1, -1), torch.inf
+    )
+    top_values, expected_blocks = block_scores.topk(top_k_blocks, dim=-1)
+    expected_blocks = expected_blocks.masked_fill(top_values.isneginf(), num_blocks)
+    torch.testing.assert_close(
+        metadata.selection.indices.sort(dim=-1).values,
+        expected_blocks.sort(dim=-1).values.to(torch.int32),
+    )
+
+    block_mask = torch.zeros_like(block_scores, dtype=torch.bool)
+    valid_blocks = expected_blocks < num_blocks
+    block_mask.scatter_(3, expected_blocks.clamp_max(num_blocks - 1), valid_blocks)
+    token_mask = (
+        block_mask[..., None]
+        .expand(batch, n_proxy_heads, seq_len, num_blocks, 128)
+        .reshape(batch, n_proxy_heads, seq_len, seq_len)
+        .repeat_interleave(n_heads // n_proxy_heads, dim=1)
+    )
+    attention_mask = token_mask & valid
+    main_k = k.repeat_interleave(n_heads // n_kv_heads, dim=1)
+    main_v = v.repeat_interleave(n_heads // n_kv_heads, dim=1)
+    scores = (q.float() @ main_k.float().transpose(-2, -1)) * scale
+    scores.masked_fill_(~attention_mask, float("-inf"))
+    expected_lse = scores.logsumexp(dim=-1)
+    expected = (
+        (scores.softmax(dim=-1) @ main_v.float())
+        .to(torch.bfloat16)
+        .transpose(1, 2)
+        .reshape(batch, seq_len, -1)
+    )
+
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(actual_lse, expected_lse, atol=2e-5, rtol=2e-5)
 
 
 @pytest.mark.parametrize("kernel", [flash_msa_func, flash_msa_warmup_func])

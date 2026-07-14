@@ -87,10 +87,11 @@ def _run_proxy_lse_flash(
     """Compute dense causal proxy LSE for the KL-gradient branch."""
 
     from flash_msa._flash_attn_compat import (
+        flash_attn_causal_document_mask,
+        flash_attn_lse_value_dim,
         flash_attn_supports_narrow_value_dim,
         flash_attn_varlen_forward,
     )
-    from flash_msa.sparse_flash_varlen import _lse_value_dim
 
     batch, n_proxy_heads, seq_len, head_dim = q_proxy.shape
     n_proxy_kv_heads = k_proxy.shape[1]
@@ -108,11 +109,9 @@ def _run_proxy_lse_flash(
         batch + 1, device=q_proxy.device, dtype=torch.int32
     ) * int(seq_len)
 
-    from flash_msa.sparse_flash_varlen import _causal_document_mask
-
     if flash_attn_supports_narrow_value_dim():
         value = torch.zeros(
-            (*k_pack.shape[:-1], _lse_value_dim(k_proxy.device)),
+            (*k_pack.shape[:-1], flash_attn_lse_value_dim(k_proxy.device)),
             device=k_proxy.device,
             dtype=k_proxy.dtype,
         )
@@ -128,7 +127,7 @@ def _run_proxy_lse_flash(
         max_seqlen_k=int(seq_len),
         softmax_scale=float(scale),
         causal=not document_ids.numel(),
-        mask_mod=_causal_document_mask if document_ids.numel() else None,
+        mask_mod=(flash_attn_causal_document_mask() if document_ids.numel() else None),
         aux_tensors=[document_ids.reshape(-1)] if document_ids.numel() else None,
     )
     return _lse_from_flash(lse, batch=batch, n_heads=n_proxy_heads, seq_len=seq_len)
@@ -213,9 +212,7 @@ def run_warmup_backward(
         scale=float(scale),
         grad_kl_scale=proxy_grad_scale,
         kl_metric_scale=(
-            1.0 / float(batch * n_proxy_heads * seq_len)
-            if record_kl_metric
-            else 0.0
+            1.0 / float(batch * n_proxy_heads * seq_len) if record_kl_metric else 0.0
         ),
         record_kl_metric=record_kl_metric,
     )

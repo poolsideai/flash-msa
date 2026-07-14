@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import sys
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 import torch
 from torch.utils.cpp_extension import load
@@ -123,22 +124,123 @@ class ReverseIndexWorkspace:
 _DEFAULT_WORKSPACE = ReverseIndexWorkspace()
 
 
-@dataclass
-class SparseAttentionMetadata:
-    """Persistent selection and reverse-index metadata for one forward."""
+class BlockSparseSelection(NamedTuple):
+    """Exact token selections and reusable FA4 forward schedules."""
 
+    indices: torch.Tensor
+    counts: torch.Tensor
+    proxy_block_counts: torch.Tensor
+    proxy_block_indices: torch.Tensor
+    proxy_empty_block_counts: torch.Tensor
+    main_block_counts: torch.Tensor
+    main_block_indices: torch.Tensor
+    main_empty_block_counts: torch.Tensor
+
+
+@dataclass(frozen=True)
+class SparseAttentionMetadata:
+    """Persistent exact selection and backward schedule for one forward."""
+
+    selection: BlockSparseSelection
     task_meta: torch.Tensor
     task_qids: torch.Tensor
-    remote_destinations: torch.Tensor
-    remote_positions: torch.Tensor
-    remote_cu_seqlens: torch.Tensor
     document_ids: torch.Tensor
-    remote_q_document_ids: torch.Tensor
-    remote_k_document_ids: torch.Tensor
-    batch: int
-    n_proxy_heads: int
-    seq_len: int
-    top_k_blocks: int
+    query_block_size: int
+
+    @property
+    def batch(self) -> int:
+        return int(self.selection.indices.shape[0])
+
+    @property
+    def n_proxy_heads(self) -> int:
+        return int(self.selection.indices.shape[1])
+
+    @property
+    def seq_len(self) -> int:
+        return int(self.selection.indices.shape[2])
+
+    @property
+    def top_k_blocks(self) -> int:
+        return int(self.selection.indices.shape[3])
+
+    @property
+    def selected_block_counts(self) -> torch.Tensor:
+        return self.selection.counts
+
+    @property
+    def scheduled_block_counts(self) -> torch.Tensor:
+        return self.selection.main_block_counts
+
+
+def build_block_sparse_selection(
+    block_indices: torch.Tensor,
+    *,
+    n_main_heads: int,
+    query_block_size: int,
+) -> BlockSparseSelection:
+    """Build exact token selections and reusable FA4 forward schedules."""
+
+    batch, n_proxy_heads, seq_len, top_k_blocks = map(int, block_indices.shape)
+    if n_main_heads % n_proxy_heads:
+        raise ValueError("n_main_heads must be divisible by n_proxy_heads")
+    if seq_len % query_block_size:
+        raise ValueError(
+            "sequence length must be divisible by the FA4 query block size"
+        )
+    num_blocks = seq_len // BLOCK_SIZE
+    num_query_blocks = seq_len // query_block_size
+    valid = block_indices < num_blocks
+    counts = valid.sum(dim=-1, dtype=torch.int32).contiguous()
+
+    union_slots = torch.where(valid, block_indices, num_blocks).view(
+        batch,
+        n_proxy_heads,
+        num_query_blocks,
+        query_block_size * top_k_blocks,
+    )
+    union = torch.zeros(
+        (batch, n_proxy_heads, num_query_blocks, num_blocks + 1),
+        dtype=torch.bool,
+        device=block_indices.device,
+    )
+    union.scatter_(3, union_slots.to(torch.int64), True)
+    union = union[..., :num_blocks]
+    proxy_counts = union.sum(dim=-1, dtype=torch.int32).contiguous()
+    max_union = min(num_blocks, query_block_size * top_k_blocks)
+    priority = num_blocks - torch.arange(
+        num_blocks,
+        dtype=torch.int32,
+        device=block_indices.device,
+    )
+    proxy_indices = (
+        torch.topk(
+            union.to(torch.int32) * priority,
+            max_union,
+            dim=-1,
+            sorted=True,
+        )
+        .indices.to(torch.int32)
+        .contiguous()
+    )
+    main_per_proxy = n_main_heads // n_proxy_heads
+    main_counts = proxy_counts.repeat_interleave(main_per_proxy, dim=1).contiguous()
+    return BlockSparseSelection(
+        indices=block_indices,
+        counts=counts,
+        proxy_block_counts=proxy_counts,
+        proxy_block_indices=proxy_indices,
+        proxy_empty_block_counts=torch.zeros_like(proxy_counts),
+        main_block_counts=main_counts,
+        main_block_indices=proxy_indices.repeat_interleave(
+            main_per_proxy,
+            dim=1,
+        ).contiguous(),
+        main_empty_block_counts=torch.zeros(
+            (batch, n_main_heads, num_query_blocks),
+            dtype=torch.int32,
+            device=block_indices.device,
+        ),
+    )
 
 
 def document_ids_from_cu_seqlens(
@@ -285,23 +387,37 @@ def build_dense_causal_schedule_cuda(
 def build_sparse_attention_metadata_cuda(
     block_indices: torch.Tensor,
     *,
+    n_main_heads: int,
     backward_query_chunk: int,
     document_ids: torch.Tensor,
 ) -> SparseAttentionMetadata:
-    """Build persistent padded backward tasks without host synchronization."""
+    """Build persistent exact forward and backward schedules on CUDA."""
 
     if block_indices.device.type != "cuda" or block_indices.ndim != 4:
         raise ValueError("block_indices must be a CUDA tensor shaped [B, Hp, S, Kb]")
     block_indices_c = block_indices.detach().to(torch.int32).contiguous()
-    batch, n_proxy_heads, seq_len, top_k_blocks = map(int, block_indices_c.shape)
+    batch, _n_proxy_heads, seq_len, _top_k_blocks = map(int, block_indices_c.shape)
     if seq_len % BLOCK_SIZE:
         raise ValueError(f"sequence length must be divisible by {BLOCK_SIZE}")
-    if document_ids.numel():
-        if document_ids.shape != (batch, seq_len):
-            raise ValueError("document_ids must have shape [B, S]")
-        document_ids_c = document_ids.detach().to(torch.int32).contiguous()
-    else:
-        document_ids_c = document_ids.detach().to(torch.int32).contiguous()
+    if document_ids.numel() and document_ids.shape != (batch, seq_len):
+        raise ValueError("document_ids must have shape [B, S]")
+    document_ids_c = document_ids.detach().to(torch.int32).contiguous()
+    major, minor = torch.cuda.get_device_capability(block_indices_c.device)
+    match major:
+        case 9:
+            query_block_size = BLOCK_SIZE
+        case 10 | 11:
+            query_block_size = 2 * BLOCK_SIZE
+        case _:
+            raise NotImplementedError(
+                f"FA4 block-sparse attention is not supported on SM{major}{minor}"
+            )
+    selection = build_block_sparse_selection(
+        block_indices_c,
+        n_main_heads=int(n_main_heads),
+        query_block_size=query_block_size,
+    )
+
     # Use a per-forward workspace: these tensors are saved by autograd and must
     # not be overwritten by a later forward before its corresponding backward.
     backward_workspace = ReverseIndexWorkspace()
@@ -311,77 +427,20 @@ def build_sparse_attention_metadata_cuda(
         workspace=backward_workspace,
     )
 
-    num_blocks = seq_len // BLOCK_SIZE
-    num_buckets = batch * n_proxy_heads * num_blocks
-    num_remote_edges = batch * n_proxy_heads * seq_len * (top_k_blocks - 1)
-    remote_counts = torch.empty(
-        num_buckets, device=block_indices_c.device, dtype=torch.int32
-    )
-    remote_write_counts = torch.empty_like(remote_counts)
-    remote_cu_seqlens = torch.empty(
-        num_buckets + 1, device=block_indices_c.device, dtype=torch.int32
-    )
-    remote_destinations = torch.empty(
-        num_remote_edges, device=block_indices_c.device, dtype=torch.int64
-    )
-    remote_positions = torch.empty(
-        num_remote_edges, device=block_indices_c.device, dtype=torch.int32
-    )
-    remote_valid = torch.empty(
-        num_remote_edges, device=block_indices_c.device, dtype=torch.uint8
-    )
-    if num_remote_edges:
-        _load_ext().run_build_remote_layout(
-            block_indices_c,
-            remote_counts,
-            remote_write_counts,
-            remote_cu_seqlens,
-            remote_destinations,
-            remote_positions,
-            remote_valid,
-            int(BLOCK_SIZE),
-        )
-        # FA4 reads only the compact prefix in remote_cu_seqlens. Spread the
-        # fixed trailing buffer so zero-weight merge atomics do not contend.
-        tail_destinations = torch.arange(
-            num_remote_edges,
-            device=block_indices_c.device,
-            dtype=torch.int64,
-        ).remainder(batch * n_proxy_heads * seq_len)
-        remote_destinations = torch.where(
-            remote_valid != 0,
-            remote_destinations,
-            tail_destinations,
-        )
-    if document_ids_c.numel():
-        document_ids_by_proxy = (
-            document_ids_c[:, None, :].expand(batch, n_proxy_heads, seq_len).reshape(-1)
-        )
-        remote_q_document_ids = document_ids_by_proxy[remote_destinations]
-        remote_k_document_ids = document_ids_by_proxy.contiguous()
-    else:
-        remote_q_document_ids = document_ids_c
-        remote_k_document_ids = document_ids_c
-
     return SparseAttentionMetadata(
+        selection=selection,
         task_meta=task_meta,
         task_qids=task_qids,
-        remote_destinations=remote_destinations,
-        remote_positions=remote_positions,
-        remote_cu_seqlens=remote_cu_seqlens,
         document_ids=document_ids_c,
-        remote_q_document_ids=remote_q_document_ids,
-        remote_k_document_ids=remote_k_document_ids,
-        batch=batch,
-        n_proxy_heads=n_proxy_heads,
-        seq_len=seq_len,
-        top_k_blocks=top_k_blocks,
+        query_block_size=query_block_size,
     )
 
 
 __all__ = [
+    "BlockSparseSelection",
     "ReverseIndexWorkspace",
     "SparseAttentionMetadata",
+    "build_block_sparse_selection",
     "build_dense_causal_schedule_cuda",
     "build_reverse_index_cuda",
     "build_sparse_attention_metadata_cuda",

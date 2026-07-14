@@ -123,87 +123,6 @@ __global__ void scatter_edges_kernel(
     }
 }
 
-__global__ void count_remote_slots_kernel(
-    int const* __restrict__ block_indices,
-    int* __restrict__ counts,
-    int B,
-    int Hp,
-    int S,
-    int Kb,
-    int NB)
-{
-    int remote_slots = Kb - 1;
-    int64_t E = (int64_t)B * Hp * S * remote_slots;
-    int64_t stride = (int64_t)blockDim.x * gridDim.x;
-    for (int64_t e = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; e < E; e += stride) {
-        int slot = (int)(e % remote_slots) + 1;
-        int64_t tmp = e / remote_slots;
-        int q = (int)(tmp % S);
-        tmp /= S;
-        int p = (int)(tmp % Hp);
-        int b = (int)(tmp / Hp);
-        int key_block = block_indices[((int64_t)(b * Hp + p) * S + q) * Kb + slot];
-        if ((unsigned)key_block >= (unsigned)NB || key_block >= q / 128) {
-            continue;
-        }
-        int bucket = (b * Hp + p) * NB + key_block;
-        atomicAdd(counts + bucket, 1);
-    }
-}
-
-__global__ void scan_remote_offsets_kernel(
-    int const* __restrict__ counts,
-    int* __restrict__ bucket_offsets,
-    int buckets)
-{
-    if (blockIdx.x != 0 || threadIdx.x != 0) {
-        return;
-    }
-
-    int edge = 0;
-    for (int bucket = 0; bucket < buckets; ++bucket) {
-        bucket_offsets[bucket] = edge;
-        edge += counts[bucket];
-    }
-    bucket_offsets[buckets] = edge;
-}
-
-__global__ void scatter_remote_slots_kernel(
-    int const* __restrict__ block_indices,
-    int const* __restrict__ bucket_offsets,
-    int* __restrict__ write_counts,
-    int64_t* __restrict__ destinations,
-    int* __restrict__ positions,
-    uint8_t* __restrict__ valid,
-    int B,
-    int Hp,
-    int S,
-    int Kb,
-    int NB)
-{
-    int remote_slots = Kb - 1;
-    int64_t E = (int64_t)B * Hp * S * remote_slots;
-    int64_t stride = (int64_t)blockDim.x * gridDim.x;
-    for (int64_t e = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; e < E; e += stride) {
-        int slot = (int)(e % remote_slots) + 1;
-        int64_t tmp = e / remote_slots;
-        int q = (int)(tmp % S);
-        tmp /= S;
-        int p = (int)(tmp % Hp);
-        int b = (int)(tmp / Hp);
-        int key_block = block_indices[((int64_t)(b * Hp + p) * S + q) * Kb + slot];
-        if ((unsigned)key_block >= (unsigned)NB || key_block >= q / 128) {
-            continue;
-        }
-
-        int bucket = (b * Hp + p) * NB + key_block;
-        int pos = bucket_offsets[bucket] + atomicAdd(write_counts + bucket, 1);
-        destinations[pos] = (int64_t)(b * Hp + p) * S + q;
-        positions[e] = pos;
-        valid[pos] = true;
-    }
-}
-
 __global__ void fill_dense_schedule_kernel(
     int64_t const* __restrict__ bucket_offsets,
     int* __restrict__ task_meta,
@@ -336,69 +255,6 @@ void run_build_reverse_index(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void run_build_remote_layout(
-    torch::Tensor block_indices,
-    torch::Tensor counts,
-    torch::Tensor write_counts,
-    torch::Tensor bucket_offsets,
-    torch::Tensor destinations,
-    torch::Tensor positions,
-    torch::Tensor valid,
-    int64_t block_size)
-{
-    CHECK_INPUT(block_indices);
-    CHECK_INPUT(counts);
-    CHECK_INPUT(write_counts);
-    CHECK_INPUT(bucket_offsets);
-    CHECK_CUDA(destinations);
-    CHECK_CONTIGUOUS(destinations);
-    CHECK_INPUT(positions);
-    CHECK_CUDA(valid);
-    CHECK_CONTIGUOUS(valid);
-
-    TORCH_CHECK(block_size == 128, "remote layout currently requires block_size=128");
-    TORCH_CHECK(block_indices.dim() == 4, "block_indices must have shape [B, Hp, S, Kb]");
-    TORCH_CHECK(destinations.scalar_type() == at::kLong, "destinations must be int64");
-    TORCH_CHECK(valid.scalar_type() == at::kByte, "valid must be uint8");
-
-    int B = (int)block_indices.size(0);
-    int Hp = (int)block_indices.size(1);
-    int S = (int)block_indices.size(2);
-    int Kb = (int)block_indices.size(3);
-    int NB = S / (int)block_size;
-    int buckets = B * Hp * NB;
-    int64_t remote_edges = (int64_t)B * Hp * S * (Kb - 1);
-
-    TORCH_CHECK(S % block_size == 0, "S must be divisible by block_size");
-    TORCH_CHECK(Kb > 1, "remote layout requires at least two selected blocks");
-    TORCH_CHECK(counts.numel() == buckets && write_counts.numel() == buckets, "remote counts have wrong size");
-    TORCH_CHECK(bucket_offsets.numel() == buckets + 1, "bucket_offsets has wrong size");
-    TORCH_CHECK(destinations.numel() == remote_edges && positions.numel() == remote_edges && valid.numel() == remote_edges, "remote edge buffers have wrong size");
-
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    C10_CUDA_CHECK(cudaMemsetAsync(counts.data_ptr<int>(), 0, counts.numel() * sizeof(int), stream));
-    C10_CUDA_CHECK(cudaMemsetAsync(write_counts.data_ptr<int>(), 0, write_counts.numel() * sizeof(int), stream));
-    C10_CUDA_CHECK(cudaMemsetAsync(destinations.data_ptr<int64_t>(), 0, destinations.numel() * sizeof(int64_t), stream));
-    C10_CUDA_CHECK(cudaMemsetAsync(positions.data_ptr<int>(), 0xff, positions.numel() * sizeof(int), stream));
-    C10_CUDA_CHECK(cudaMemsetAsync(valid.data_ptr<uint8_t>(), 0, valid.numel() * sizeof(uint8_t), stream));
-
-    int blocks = (int)std::min<int64_t>((remote_edges + kThreads - 1) / kThreads, 65535);
-    blocks = std::max(blocks, 1);
-    count_remote_slots_kernel<<<blocks, kThreads, 0, stream>>>(
-        block_indices.data_ptr<int>(), counts.data_ptr<int>(), B, Hp, S, Kb, NB);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-
-    scan_remote_offsets_kernel<<<1, 1, 0, stream>>>(
-        counts.data_ptr<int>(), bucket_offsets.data_ptr<int>(), buckets);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-
-    scatter_remote_slots_kernel<<<blocks, kThreads, 0, stream>>>(
-        block_indices.data_ptr<int>(), bucket_offsets.data_ptr<int>(), write_counts.data_ptr<int>(),
-        destinations.data_ptr<int64_t>(), positions.data_ptr<int>(), valid.data_ptr<uint8_t>(),
-        B, Hp, S, Kb, NB);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-}
-
 void run_build_dense_schedule(
     torch::Tensor bucket_offsets,
     torch::Tensor task_meta,
@@ -439,6 +295,5 @@ void run_build_dense_schedule(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("run_build_reverse_index", &run_build_reverse_index, "Build MSA reverse index on CUDA");
-    m.def("run_build_remote_layout", &run_build_remote_layout, "Build the MSA remote varlen layout on CUDA");
     m.def("run_build_dense_schedule", &run_build_dense_schedule, "Build the dense MSA backward schedule on CUDA");
 }

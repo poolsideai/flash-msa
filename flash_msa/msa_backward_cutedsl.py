@@ -1134,6 +1134,24 @@ def _compile_fused_backward_kernel(
         dk.element_type,
         dv.element_type,
         kl_metric.element_type,
+        tuple(q_proxy.stride),
+        tuple(k_proxy.stride),
+        tuple(q.stride),
+        tuple(k.stride),
+        tuple(v.stride),
+        tuple(grad_o_main.stride),
+        tuple(lse_main.stride),
+        tuple(lse_proxy.stride),
+        tuple(delta_main.stride),
+        tuple(task_meta.stride),
+        tuple(task_qids.stride),
+        tuple(document_ids.stride),
+        tuple(dq_proxy.stride),
+        tuple(dk_proxy.stride),
+        tuple(dq.stride),
+        tuple(dk.stride),
+        tuple(dv.stride),
+        tuple(kl_metric.stride),
     )
     if key not in _COMPILE_CACHE:
         kernel = _MSAFusedBackwardMMAKernel(
@@ -1207,20 +1225,20 @@ def _run_fused_backward_impl(
     if q.dtype not in (torch.float16, torch.bfloat16):
         raise TypeError(f"fused backward supports fp16/bf16, got {q.dtype}")
 
-    q_c = q.detach().contiguous()
-    k_c = k.detach().contiguous()
+    q_c = q.detach()
+    k_c = k.detach()
     lse_main_c = lse_main.detach().to(torch.float32).contiguous()
     compute_proxy_gradients = grad_kl_scale != 0.0 or record_kl_metric
     if compute_proxy_gradients:
-        q_proxy_c = q_proxy.detach().contiguous()
-        k_proxy_c = k_proxy.detach().contiguous()
+        q_proxy_c = q_proxy.detach()
+        k_proxy_c = k_proxy.detach()
         lse_proxy_c = lse_proxy.detach().to(torch.float32).contiguous()
     else:
         q_proxy_c = q_c[:, : q_proxy.shape[1]]
         k_proxy_c = k_c[:, : k_proxy.shape[1]]
         lse_proxy_c = lse_main_c[:, : q_proxy.shape[1]]
     if compute_main_gradients:
-        v_c = v.detach().contiguous()
+        v_c = v.detach()
         grad_o_c = grad_o_main.detach().to(dtype=q.dtype).contiguous()
         delta_main_c = delta_main.detach().to(torch.float32).contiguous()
     else:

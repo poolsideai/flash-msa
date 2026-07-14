@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import torch
 
+from flash_msa._flash_attn_compat import flash_attn_block_sparse_forward
 from flash_msa.reverse_index_cuda import SparseAttentionMetadata
-from flash_msa.sparse_flash_varlen import sparse_flash_varlen_forward
 
 BLOCK_SIZE = 128
 
@@ -53,18 +53,18 @@ def run_main_forward(
         raise NotImplementedError(f"MSA forward requires D=128, got {head_dim}")
     _validate_head_tiling(n_heads, n_kv_heads, n_proxy_heads)
 
-    q_c = q.detach().contiguous()
-    k_c = k.detach().contiguous()
-    v_c = v.detach().contiguous()
-
-    o_main, lse_main = sparse_flash_varlen_forward(
-        q_c,
-        k_c,
-        v_c,
-        metadata=metadata,
-        scale=float(scale),
-        return_output=True,
+    output_tokens, lse_main = flash_attn_block_sparse_forward(
+        q=q.detach().transpose(1, 2),
+        k=k.detach().transpose(1, 2),
+        v=v.detach().transpose(1, 2),
+        selection=metadata.selection,
+        use_main_schedule=True,
+        group_size=n_heads // n_proxy_heads,
+        query_block_size=metadata.query_block_size,
+        key_block_size=BLOCK_SIZE,
+        softmax_scale=float(scale),
+        document_ids=metadata.document_ids,
     )
-    assert o_main is not None
+    o_main = output_tokens.transpose(1, 2)
     kl_loss = torch.zeros((), dtype=torch.float32, device=q.device)
     return o_main, lse_main, kl_loss

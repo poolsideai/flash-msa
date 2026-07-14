@@ -14,6 +14,7 @@ from flash_msa.msa_backward_cutedsl import (
 )
 from flash_msa.msa_forward_cutedsl import run_main_forward
 from flash_msa.reverse_index_cuda import (
+    BlockSparseSelection,
     SparseAttentionMetadata,
     build_sparse_attention_metadata_cuda,
     resolve_document_ids,
@@ -92,7 +93,7 @@ def prepare_sparse_attention(
     *,
     cu_seqlens: torch.Tensor | None = None,
 ) -> SparseAttentionMetadata:
-    """Select blocks and pack the immutable schedule used by forward and backward."""
+    """Select blocks and build the immutable schedules used by forward and backward."""
 
     document_ids = resolve_document_ids(q, document_list, cu_seqlens)
     num_blocks, top_k_blocks = _validate_inputs(
@@ -118,6 +119,7 @@ def prepare_sparse_attention(
     )
     return build_sparse_attention_metadata_cuda(
         block_indices,
+        n_main_heads=q.shape[1],
         backward_query_chunk=2 * query_chunk,
         document_ids=document_ids,
     )
@@ -345,6 +347,7 @@ class _SparseAttentionFunction(torch.autograd.Function):
         )
         metadata = build_sparse_attention_metadata_cuda(
             block_indices,
+            n_main_heads=n_heads,
             backward_query_chunk=2 * query_chunk,
             document_ids=document_ids,
         )
@@ -369,30 +372,26 @@ class _SparseAttentionFunction(torch.autograd.Function):
             o_main,
             metadata.task_meta,
             metadata.task_qids,
-            metadata.remote_destinations,
-            metadata.remote_positions,
-            metadata.remote_cu_seqlens,
             metadata.document_ids,
-            metadata.remote_q_document_ids,
-            metadata.remote_k_document_ids,
+            metadata.selection.indices,
+            metadata.selection.counts,
+            metadata.selection.proxy_block_counts,
+            metadata.selection.proxy_block_indices,
+            metadata.selection.proxy_empty_block_counts,
         )
         ctx.save_for_backward(*save_tensors)
+        ctx.query_block_size = metadata.query_block_size
         ctx.scale = float(scale)
         ctx.kl_metric = kl_metric
         ctx.record_kl_metric = bool(record_kl_metric)
         if ctx.record_kl_metric:
             kl_metric.zero_()
-        ctx.metadata_shape = (
-            metadata.batch,
-            metadata.n_proxy_heads,
-            metadata.seq_len,
-            metadata.top_k_blocks,
-        )
         ctx.set_materialize_grads(False)
         return out, kl_loss
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor | None, grad_kl: torch.Tensor | None):
+        common_tensors = ctx.saved_tensors[:15]
         (
             q_proxy,
             k_proxy,
@@ -403,27 +402,29 @@ class _SparseAttentionFunction(torch.autograd.Function):
             o_main,
             task_meta,
             task_qids,
-            remote_destinations,
-            remote_positions,
-            remote_cu_seqlens,
             document_ids,
-            remote_q_document_ids,
-            remote_k_document_ids,
-        ) = ctx.saved_tensors
-        batch, n_proxy_heads, seq_len, top_k_blocks = ctx.metadata_shape
+            block_indices,
+            block_counts,
+            proxy_block_counts,
+            proxy_block_indices,
+            proxy_empty_block_counts,
+        ) = common_tensors
+        proxy_selection = BlockSparseSelection(
+            indices=block_indices,
+            counts=block_counts,
+            proxy_block_counts=proxy_block_counts,
+            proxy_block_indices=proxy_block_indices,
+            proxy_empty_block_counts=proxy_empty_block_counts,
+            main_block_counts=proxy_block_counts,
+            main_block_indices=proxy_block_indices,
+            main_empty_block_counts=proxy_empty_block_counts,
+        )
         metadata = SparseAttentionMetadata(
+            selection=proxy_selection,
             task_meta=task_meta,
             task_qids=task_qids,
-            remote_destinations=remote_destinations,
-            remote_positions=remote_positions,
-            remote_cu_seqlens=remote_cu_seqlens,
             document_ids=document_ids,
-            remote_q_document_ids=remote_q_document_ids,
-            remote_k_document_ids=remote_k_document_ids,
-            batch=batch,
-            n_proxy_heads=n_proxy_heads,
-            seq_len=seq_len,
-            top_k_blocks=top_k_blocks,
+            query_block_size=ctx.query_block_size,
         )
 
         if grad_out is None:

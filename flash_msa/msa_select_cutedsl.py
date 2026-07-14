@@ -16,6 +16,10 @@ from cutlass import Int32, cute
 from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.cute.runtime import from_dlpack
 
+from flash_msa._flash_attn_compat import (
+    flash_attn_block_sparse_forward,
+    flash_attn_lse_value_dim,
+)
 from flash_msa.reverse_index_cuda import SparseAttentionMetadata
 
 BLOCK_SIZE = 128
@@ -601,16 +605,17 @@ def compute_proxy_lse(
     ):
         raise ValueError("metadata has an incompatible shape")
 
-    q_c = q_proxy.detach().contiguous()
-    k_c = k_proxy.detach().contiguous()
-    from flash_msa.sparse_flash_varlen import sparse_flash_varlen_forward
-
-    _unused_out, lse_proxy = sparse_flash_varlen_forward(
-        q_c,
-        k_c,
-        k_c,
-        metadata=metadata,
-        scale=float(scale),
-        return_output=False,
+    k_tokens = k_proxy.detach().transpose(1, 2)
+    _unused_out, lse_proxy = flash_attn_block_sparse_forward(
+        q=q_proxy.detach().transpose(1, 2),
+        k=k_tokens,
+        v=k_tokens[..., : flash_attn_lse_value_dim(k_proxy.device)],
+        selection=metadata.selection,
+        use_main_schedule=False,
+        group_size=1,
+        query_block_size=metadata.query_block_size,
+        key_block_size=BLOCK_SIZE,
+        softmax_scale=float(scale),
+        document_ids=metadata.document_ids,
     )
     return lse_proxy

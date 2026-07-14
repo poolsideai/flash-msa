@@ -1,3 +1,5 @@
+import importlib
+
 import pytest
 import torch
 
@@ -10,10 +12,6 @@ from flash_msa import (
     sparse_main_attention,
     sparse_proxy_vjp,
 )
-from flash_msa.sparse_flash_varlen import (
-    _merge_remote_attention,
-    _merge_remote_lse,
-)
 
 
 def _inputs() -> tuple[dict[str, torch.Tensor], torch.Tensor]:
@@ -25,10 +23,20 @@ def _inputs() -> tuple[dict[str, torch.Tensor], torch.Tensor]:
         "k": (batch, 1, seq_len, head_dim),
         "v": (batch, 1, seq_len, head_dim),
     }
-    tensors = {
-        name: torch.randn(shape, device="cuda", dtype=torch.bfloat16)
-        for name, shape in shapes.items()
-    }
+    tensors = {}
+    for name, shape in shapes.items():
+        if name in ("q", "k", "v"):
+            batch, heads, seq_len, head_dim = shape
+            tensors[name] = torch.randn(
+                batch,
+                seq_len,
+                heads,
+                head_dim,
+                device="cuda",
+                dtype=torch.bfloat16,
+            ).transpose(1, 2)
+        else:
+            tensors[name] = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
     document_ids = torch.empty(batch, seq_len, device="cuda", dtype=torch.int32)
     document_ids[:, :190] = 0
     document_ids[:, 190:350] = 1
@@ -43,77 +51,11 @@ def _clone(inputs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     }
 
 
-def test_streaming_remote_merge_matches_grouped_reference() -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("requires CUDA")
-
-    torch.manual_seed(5)
-    tokens, heads, remote_blocks, value_dim = 17, 6, 3, 128
-    remote_rows = tokens * remote_blocks
-    positions = torch.arange(
-        remote_rows,
-        device="cuda",
-        dtype=torch.int32,
-    ).view(tokens, remote_blocks)
-    positions[::3, -1] = -1
-    local_lse = torch.randn(tokens, heads, device="cuda")
-    remote_lse = torch.randn(remote_rows, heads, device="cuda")
-    local_output = torch.randn(
-        tokens,
-        heads,
-        value_dim,
-        device="cuda",
-        dtype=torch.bfloat16,
-    )
-    remote_output = torch.randn(
-        remote_rows,
-        heads,
-        value_dim,
-        device="cuda",
-        dtype=torch.bfloat16,
-    )
-
-    valid = positions >= 0
-    safe_positions = positions.clamp_min(0)
-    gathered_lse = remote_lse[safe_positions].masked_fill(
-        ~valid[..., None],
-        float("-inf"),
-    )
-    max_lse = torch.maximum(local_lse, gathered_lse.amax(dim=1))
-    local_weight = (local_lse - max_lse).exp()
-    remote_weight = (gathered_lse - max_lse[:, None]).exp()
-    denominator = local_weight + remote_weight.sum(dim=1)
-    expected_output = (
-        local_output.float() * local_weight[..., None]
-        + (
-            remote_output[safe_positions].float()
-            * remote_weight[..., None]
-            * valid[..., None, None]
-        ).sum(dim=1)
-    ) / denominator[..., None]
-    expected_lse = max_lse + denominator.log()
-
-    output, lse = _merge_remote_attention(
-        local_output,
-        local_lse,
-        remote_output,
-        remote_lse,
-        positions,
-    )
-    lse_only = _merge_remote_lse(local_lse, remote_lse, positions)
-
-    torch.testing.assert_close(
-        output,
-        expected_output.to(output.dtype),
-        atol=8e-3,
-        rtol=8e-3,
-    )
-    torch.testing.assert_close(lse, expected_lse, atol=2e-6, rtol=2e-6)
-    torch.testing.assert_close(lse_only, expected_lse, atol=2e-6, rtol=2e-6)
-
-
 @pytest.mark.parametrize("dense", [False, True], ids=["sparse", "warmup"])
-def test_decomposed_main_and_indexer_gradients_match_combined(dense: bool) -> None:
+def test_decomposed_main_and_indexer_gradients_match_combined(
+    dense: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0):
         pytest.skip("Flash-MSA requires Hopper or newer")
 
@@ -165,6 +107,26 @@ def test_decomposed_main_and_indexer_gradients_match_combined(dense: bool) -> No
             document_ids,
         )
     else:
+        api = importlib.import_module("flash_msa.flash_msa")
+        reverse_index = importlib.import_module("flash_msa.reverse_index_cuda")
+        select_blocks = api.select_blocks
+        build_selection = reverse_index.build_block_sparse_selection
+        calls = {"select": 0, "schedule": 0}
+
+        def counted_select(*args, **kwargs):
+            calls["select"] += 1
+            return select_blocks(*args, **kwargs)
+
+        def counted_build(*args, **kwargs):
+            calls["schedule"] += 1
+            return build_selection(*args, **kwargs)
+
+        monkeypatch.setattr(api, "select_blocks", counted_select)
+        monkeypatch.setattr(
+            reverse_index,
+            "build_block_sparse_selection",
+            counted_build,
+        )
         metadata = prepare_sparse_attention(
             candidate["q_proxy"],
             candidate["k_proxy"],
@@ -175,28 +137,55 @@ def test_decomposed_main_and_indexer_gradients_match_combined(dense: bool) -> No
             scale,
             document_ids,
         )
-        saved_tensor_ids: set[int] = set()
-
-        def record_saved_tensor(tensor: torch.Tensor) -> torch.Tensor:
-            saved_tensor_ids.add(id(tensor))
-            return tensor
-
-        with torch.autograd.graph.saved_tensors_hooks(
-            record_saved_tensor, lambda tensor: tensor
-        ):
-            candidate_out, lse = sparse_main_attention(
+        schedule_ptrs = tuple(
+            tensor.data_ptr()
+            for tensor in (
+                metadata.selection.indices,
+                metadata.selection.counts,
+                metadata.selection.proxy_block_counts,
+                metadata.selection.proxy_block_indices,
+                metadata.selection.main_block_counts,
+                metadata.selection.main_block_indices,
+            )
+        )
+        candidate_out, lse = sparse_main_attention(
+            candidate["q"],
+            candidate["k"],
+            candidate["v"],
+            metadata,
+            scale,
+        )
+        with torch.no_grad():
+            replay_out, _replay_lse = sparse_main_attention(
                 candidate["q"],
                 candidate["k"],
                 candidate["v"],
                 metadata,
                 scale,
             )
+        assert calls == {"select": 1, "schedule": 1}
+        assert schedule_ptrs == tuple(
+            tensor.data_ptr()
+            for tensor in (
+                metadata.selection.indices,
+                metadata.selection.counts,
+                metadata.selection.proxy_block_counts,
+                metadata.selection.proxy_block_indices,
+                metadata.selection.main_block_counts,
+                metadata.selection.main_block_indices,
+            )
+        )
+        torch.testing.assert_close(replay_out, candidate_out)
+        saved_tensor_ids = {
+            id(tensor) for tensor in candidate_out.grad_fn.saved_tensors
+        }
         forward_only_metadata = (
-            metadata.remote_destinations,
-            metadata.remote_positions,
-            metadata.remote_cu_seqlens,
-            metadata.remote_q_document_ids,
-            metadata.remote_k_document_ids,
+            metadata.selection.indices,
+            metadata.selection.counts,
+            metadata.selection.proxy_block_counts,
+            metadata.selection.proxy_block_indices,
+            metadata.selection.main_block_counts,
+            metadata.selection.main_block_indices,
         )
         assert saved_tensor_ids.isdisjoint(map(id, forward_only_metadata))
         dq_proxy, dk_proxy = sparse_proxy_vjp(

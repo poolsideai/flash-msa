@@ -6,7 +6,10 @@ attention is recomputed in backward for the dense causal KL objective.
 
 import torch
 
-from flash_msa._flash_attn_compat import flash_attn_varlen_forward
+from flash_msa._flash_attn_compat import (
+    flash_attn_causal_document_mask,
+    flash_attn_varlen_forward,
+)
 
 
 def _lse_from_flash(
@@ -87,8 +90,6 @@ def run_main_forward_token_major(
         seq_len
     )
 
-    from flash_msa.sparse_flash_varlen import _causal_document_mask
-
     out, lse = flash_attn_varlen_forward(
         q=q_pack,
         k=k_pack,
@@ -99,7 +100,7 @@ def run_main_forward_token_major(
         max_seqlen_k=int(seq_len),
         softmax_scale=float(scale),
         causal=not document_ids.numel(),
-        mask_mod=_causal_document_mask if document_ids.numel() else None,
+        mask_mod=(flash_attn_causal_document_mask() if document_ids.numel() else None),
         aux_tensors=[document_ids.reshape(-1)] if document_ids.numel() else None,
     )
 

@@ -26,18 +26,15 @@ classifiers = [
 ]
 dependencies = [
   "cuda-python",
-  "nvidia-cutlass-dsl[cu13]",
+  "nvidia-cutlass-dsl[cu13]==4.5.2",
   "packaging",
   "torch>=2.11",
   "ninja",
 ]
 
-# Some form of flash is needed for varlen flash in the forward kernels
-#   but prolly better to defer to user to install the version that is supported in their env
-#   to avoid triggering silent lengthy flash builds from scratch
 [project.optional-dependencies]
 fa4 = [
-  "flash-attn-4[cu13]",
+  "flash-attn-4[cu13] @ git+https://github.com/Dao-AILab/flash-attention.git@6a94f8b906cf5ab944385d64707f9387f3dd6be9#subdirectory=flash_attn/cute",
 ]
 dev = [
   "numpy",
