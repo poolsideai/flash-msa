@@ -6,6 +6,8 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from flash_attn.cute import utils
+import triton
+import triton.language as tl
 
 from flash_msa._flash_attn_compat import (
     flash_attn_supports_narrow_value_dim,
@@ -119,7 +121,80 @@ def _local_block_attention(
     )
 
 
-@torch.compile(fullgraph=True, dynamic=False)
+@triton.jit
+def _merge_remote_kernel(
+    local_output,
+    local_lse,
+    remote_output,
+    remote_lse,
+    remote_positions,
+    output,
+    merged_lse,
+    n_heads: tl.constexpr,
+    value_dim: tl.constexpr,
+    n_remote: tl.constexpr,
+    block_heads: tl.constexpr,
+    block_dim: tl.constexpr,
+    write_output: tl.constexpr,
+) -> None:
+    token = tl.program_id(0).to(tl.int64)
+    head = tl.arange(0, block_heads)[:, None]
+    head_mask = head < n_heads
+    local_lse_value = tl.load(
+        local_lse + token * n_heads + head,
+        mask=head_mask,
+        other=0.0,
+    )
+    max_lse = local_lse_value
+    denominator = tl.full((block_heads, 1), 1.0, tl.float32)
+    if write_output:
+        dim = tl.arange(0, block_dim)[None, :]
+        dim_mask = dim < value_dim
+        accumulator = tl.load(
+            local_output + (token * n_heads + head) * value_dim + dim,
+            mask=head_mask & dim_mask,
+            other=0.0,
+        )
+
+    for slot in tl.static_range(0, n_remote):
+        position = tl.load(remote_positions + token * n_remote + slot).to(tl.int64)
+        safe_position = tl.maximum(position, 0)
+        valid = position >= 0
+        remote_lse_value = tl.load(
+            remote_lse + safe_position * n_heads + head,
+            mask=valid & head_mask,
+            other=-float("inf"),
+        )
+        next_max_lse = tl.maximum(max_lse, remote_lse_value)
+        local_rescale = tl.exp(max_lse - next_max_lse)
+        remote_weight = tl.where(
+            valid,
+            tl.exp(remote_lse_value - next_max_lse),
+            0.0,
+        )
+        denominator = denominator * local_rescale + remote_weight
+        if write_output:
+            remote_value = tl.load(
+                remote_output + (safe_position * n_heads + head) * value_dim + dim,
+                mask=valid & head_mask & dim_mask,
+                other=0.0,
+            )
+            accumulator = accumulator * local_rescale + remote_value * remote_weight
+        max_lse = next_max_lse
+
+    tl.store(
+        merged_lse + token * n_heads + head,
+        max_lse + tl.log(denominator),
+        mask=head_mask,
+    )
+    if write_output:
+        tl.store(
+            output + (token * n_heads + head) * value_dim + dim,
+            accumulator / denominator,
+            mask=head_mask & dim_mask,
+        )
+
+
 def _merge_remote_attention(
     local_output: torch.Tensor,
     local_lse: torch.Tensor,
@@ -127,46 +202,52 @@ def _merge_remote_attention(
     remote_lse: torch.Tensor,
     remote_positions: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    valid = remote_positions >= 0
-    positions = remote_positions.clamp_min(0)
-    gathered_lse = remote_lse[positions].masked_fill(
-        ~valid[..., None],
-        float("-inf"),
+    n_heads = local_lse.shape[1]
+    value_dim = local_output.shape[-1]
+    output = torch.empty_like(local_output)
+    lse = torch.empty_like(local_lse)
+    _merge_remote_kernel[(local_lse.shape[0],)](
+        local_output,
+        local_lse,
+        remote_output,
+        remote_lse,
+        remote_positions,
+        output,
+        lse,
+        n_heads=n_heads,
+        value_dim=value_dim,
+        n_remote=remote_positions.shape[1],
+        block_heads=triton.next_power_of_2(n_heads),
+        block_dim=triton.next_power_of_2(value_dim),
+        write_output=True,
+        num_warps=8,
     )
-    max_lse = torch.maximum(local_lse, gathered_lse.amax(dim=1))
-    local_weight = (local_lse - max_lse).exp()
-    remote_weight = (gathered_lse - max_lse[:, None]).exp()
-    denominator = local_weight + remote_weight.sum(dim=1)
-    output = (
-        local_output * local_weight[..., None]
-        + (
-            remote_output[positions].float()
-            * remote_weight[..., None]
-            * valid[..., None, None]
-        ).sum(dim=1)
-    ) / denominator[..., None]
-    return output, max_lse + denominator.log()
+    return output, lse
 
 
-@torch.compile(fullgraph=True, dynamic=False)
 def _merge_remote_lse(
     local_lse: torch.Tensor,
     remote_lse: torch.Tensor,
     remote_positions: torch.Tensor,
 ) -> torch.Tensor:
-    valid = remote_positions >= 0
-    gathered_lse = remote_lse[remote_positions.clamp_min(0)].masked_fill(
-        ~valid[..., None],
-        float("-inf"),
+    lse = torch.empty_like(local_lse)
+    _merge_remote_kernel[(local_lse.shape[0],)](
+        local_lse,
+        local_lse,
+        remote_lse,
+        remote_lse,
+        remote_positions,
+        lse,
+        lse,
+        n_heads=local_lse.shape[1],
+        value_dim=1,
+        n_remote=remote_positions.shape[1],
+        block_heads=triton.next_power_of_2(local_lse.shape[1]),
+        block_dim=1,
+        write_output=False,
+        num_warps=1,
     )
-    max_lse = torch.maximum(local_lse, gathered_lse.amax(dim=1))
-    return (
-        max_lse
-        + (
-            (local_lse - max_lse).exp()
-            + (gathered_lse - max_lse[:, None]).exp().sum(dim=1)
-        ).log()
-    )
+    return lse
 
 
 def sparse_flash_varlen_forward(
@@ -236,7 +317,6 @@ def sparse_flash_varlen_forward(
             .permute(0, 2, 1, 3, 4)
             .contiguous()
             .view(batch * n_proxy_heads * seq_len, main_per_proxy, -1)
-            .float()
         )
     else:
         local_output = None

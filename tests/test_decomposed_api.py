@@ -10,6 +10,10 @@ from flash_msa import (
     sparse_main_attention,
     sparse_proxy_vjp,
 )
+from flash_msa.sparse_flash_varlen import (
+    _merge_remote_attention,
+    _merge_remote_lse,
+)
 
 
 def _inputs() -> tuple[dict[str, torch.Tensor], torch.Tensor]:
@@ -37,6 +41,75 @@ def _clone(inputs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         name: tensor.detach().clone().requires_grad_(True)
         for name, tensor in inputs.items()
     }
+
+
+def test_streaming_remote_merge_matches_grouped_reference() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+
+    torch.manual_seed(5)
+    tokens, heads, remote_blocks, value_dim = 17, 6, 3, 128
+    remote_rows = tokens * remote_blocks
+    positions = torch.arange(
+        remote_rows,
+        device="cuda",
+        dtype=torch.int32,
+    ).view(tokens, remote_blocks)
+    positions[::3, -1] = -1
+    local_lse = torch.randn(tokens, heads, device="cuda")
+    remote_lse = torch.randn(remote_rows, heads, device="cuda")
+    local_output = torch.randn(
+        tokens,
+        heads,
+        value_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    remote_output = torch.randn(
+        remote_rows,
+        heads,
+        value_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+
+    valid = positions >= 0
+    safe_positions = positions.clamp_min(0)
+    gathered_lse = remote_lse[safe_positions].masked_fill(
+        ~valid[..., None],
+        float("-inf"),
+    )
+    max_lse = torch.maximum(local_lse, gathered_lse.amax(dim=1))
+    local_weight = (local_lse - max_lse).exp()
+    remote_weight = (gathered_lse - max_lse[:, None]).exp()
+    denominator = local_weight + remote_weight.sum(dim=1)
+    expected_output = (
+        local_output.float() * local_weight[..., None]
+        + (
+            remote_output[safe_positions].float()
+            * remote_weight[..., None]
+            * valid[..., None, None]
+        ).sum(dim=1)
+    ) / denominator[..., None]
+    expected_lse = max_lse + denominator.log()
+
+    output, lse = _merge_remote_attention(
+        local_output,
+        local_lse,
+        remote_output,
+        remote_lse,
+        positions,
+    )
+    lse_only = _merge_remote_lse(local_lse, remote_lse, positions)
+
+    torch.testing.assert_close(
+        output,
+        expected_output.to(output.dtype),
+        atol=8e-3,
+        rtol=8e-3,
+    )
+    torch.testing.assert_close(lse, expected_lse, atol=2e-6, rtol=2e-6)
+    torch.testing.assert_close(lse_only, expected_lse, atol=2e-6, rtol=2e-6)
 
 
 @pytest.mark.parametrize("dense", [False, True], ids=["sparse", "warmup"])
